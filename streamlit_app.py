@@ -580,10 +580,9 @@ st.altair_chart(
 # ===============================
 
 st.subheader("Hue × Value Explorer (drag to filter & see pins)")
-
 if not dom_df.empty:
+    # Scatter with brush selection
     brush = alt.selection_interval(encodings=["x","y"])
-
     scatter = (
         alt.Chart(dom_df)
         .mark_circle(size=60, opacity=0.9)
@@ -591,34 +590,30 @@ if not dom_df.empty:
             x=alt.X("h_deg:Q", title="Hue (°)", scale=alt.Scale(domain=[0,360])),
             y=alt.Y("v:Q", title="Value (0–1)", scale=alt.Scale(domain=[0,1])),
             color=alt.Color("hex:N", scale=None, legend=None),
-            tooltip=["title:N","hex:N","h_deg:Q","v:Q"],
+            tooltip=["title:N","hex:N","h_deg:Q","v:Q"]
         )
         .add_params(brush)
         .properties(height=240)
     )
 
-    # data-URI thumbnails; arranged into a compact grid
-    thumb_e = 56
-    grid_cols = 14
+    # Image panel filtered by brush; lay out in a grid using window + calculate
+    grid_cols = 8
     thumbs = (
         alt.Chart(dom_df)
         .transform_filter(brush)
         .transform_window(rn="row_number()")
         .transform_calculate(col=f"datum.rn % {grid_cols}", row=f"floor(datum.rn / {grid_cols})")
-        .mark_image(width=thumb_e, height=thumb_e)
+        .mark_image(width=90, height=90)
         .encode(
-            x=alt.X("col:O", axis=None, sort=None, scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
-            y=alt.Y("row:O", axis=None, sort=None, scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
-            url="thumb_uri:N",
-            tooltip=["title:N"],
+            x=alt.X("col:O", axis=None),
+            y=alt.Y("row:O", axis=None),
+            url="image_url:N",
+            tooltip=["title:N"]
         )
-        .properties(width=grid_cols*thumb_e, height=thumb_e * (max(1, math.ceil(len(dom_df)/grid_cols))))
-        .configure_scale(bandPaddingInner=0, bandPaddingOuter=0)
-        .configure_view(strokeWidth=0)
+        .properties(height= ((len(dom_df)//grid_cols)+1)*90, width=grid_cols*90)
     )
 
-    explorer = alt.vconcat(scatter, thumbs)  # single spec -> brush works + images show
-    st.altair_chart(explorer, use_container_width=True)
+    st.altair_chart(alt.vconcat(scatter, thumbs).resolve_scale(color="independent"), use_container_width=True)
 else:
     st.info("No dominant-color points available for the explorer.")
 
