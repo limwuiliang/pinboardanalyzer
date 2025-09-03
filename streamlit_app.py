@@ -37,6 +37,58 @@ def rgb_to_hsv_np(rgb):
     v = mx
     return np.stack([h,s,v], axis=-1)
 
+# ---- NEW: foreground pixels helper (ignores white/grey backdrops) ----
+def foreground_pixels_from_array(arr: np.ndarray, min_keep: int = 1200) -> np.ndarray:
+    """
+    Estimate background from image borders (HSV space, KMeans on border),
+    then keep pixels far from that background OR sufficiently saturated.
+    Falls back to full image if too few foreground pixels remain.
+    """
+    h, w, _ = arr.shape
+    bw = max(4, int(min(h, w) * 0.05))  # ~5% border
+    # Gather border pixels
+    top = arr[:bw, :, :]
+    bottom = arr[-bw:, :, :]
+    left = arr[:, :bw, :]
+    right = arr[:, -bw:, :]
+    border = np.concatenate([top.reshape(-1,3), bottom.reshape(-1,3),
+                             left.reshape(-1,3), right.reshape(-1,3)], axis=0)
+    # Downsample border for speed
+    if border.shape[0] > 5000:
+        sel = np.random.RandomState(42).choice(border.shape[0], 5000, replace=False)
+        border = border[sel]
+
+    # Work in HSV
+    border_hsv = rgb_to_hsv_np(border)
+    km = KMeans(n_clusters=2, n_init="auto", random_state=42).fit(border_hsv)
+    labels = km.labels_
+    counts = np.bincount(labels)
+    bg_cluster = int(np.argmax(counts))
+    bg_center = km.cluster_centers_[bg_cluster]  # (h,s,v) in [0..1]
+
+    # Distance of border pixels to bg center to set a robust threshold
+    d_border = np.linalg.norm(border_hsv - bg_center[None, :], axis=1)
+    thr = max(np.median(d_border) * 1.6, 0.08)  # adaptive + floor
+
+    full = arr.reshape(-1,3)
+    full_hsv = rgb_to_hsv_np(full)
+    d_full = np.linalg.norm(full_hsv - bg_center[None, :], axis=1)
+
+    # Low-sat high-value heuristic for white/grey screens
+    low_sat_hi_val = (full_hsv[:,1] < 0.12) & (full_hsv[:,2] > 0.92)
+
+    keep_mask = (d_full > thr) & (~low_sat_hi_val)
+
+    # If we were too aggressive, relax to a saturation gate
+    if keep_mask.sum() < min_keep:
+        keep_mask = full_hsv[:,1] > 0.08
+
+    kept = full[keep_mask]
+    # Absolute fallback if still tiny
+    if kept.shape[0] < min_keep:
+        kept = full
+    return kept
+
 def _get_cookie(key: str, cookie: str | None):
     if not cookie: return None
     m = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", cookie)
@@ -427,14 +479,18 @@ for idx, row in pins_df.iterrows():
     arr = load_image_as_array(row["image_url"], cookie=cookie)
     if arr is None:
         fetch_failures += 1; continue
-    pixels = arr.reshape(-1,3)
+
+    # ---- UPDATED: use foreground-only pixels for palette extraction ----
+    pixels = foreground_pixels_from_array(arr)  # ignores white/grey backdrop
     if pixels.shape[0] > 6000:
         sel = np.random.RandomState(42).choice(pixels.shape[0], 6000, replace=False)
         pixels = pixels[sel]
+
     km = KMeans(n_clusters=palette_k, n_init="auto", random_state=42).fit(pixels)
     centers = km.cluster_centers_.astype(float)
     hsv = rgb_to_hsv_np(centers)
     hexes = [hex_from_rgb(c) for c in centers]
+
     thumb_uri = array_to_data_uri(arr, max_side=112, fmt="JPEG", quality=78)  # CORS-free for Altair mark_image
     records.append({
         "pin_id": row.get("pin_id"),
