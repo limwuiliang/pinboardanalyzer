@@ -202,7 +202,7 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
     path = _normalize_board_path(board_url) or ""
     source_url = f"/{path}/"
     endpoint = "https://www.pinterest.com/resource/BoardFeedResource/get/"
-    pins, seen_ids, seen_urls, bookmark, pages = [], set(), set(), None, 0
+    pins, seen_ids, bookmark, pages = [], set(), None, 0
 
     def params(book):
         options = {"board_id": board_id, "page_size": page_size}
@@ -228,13 +228,14 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
                 if not img_url: continue
                 if str(o.get("board_id") or (o.get("board") or {}).get("id")) != str(board_id): continue
                 pid = str(o.get("id")) if o.get("id") else None
-                canon = canonicalize_pin_url(img_url)
                 if pid:
                     if pid in seen_ids: continue
-                    seen_ids.add(pid); seen_urls.add(canon)
+                    seen_ids.add(pid)  # keep even if URL matches another pin
                 else:
-                    if canon in seen_urls: continue
-                    seen_urls.add(canon)
+                    # no id? fall back to URL dedupe
+                    canon = canonicalize_pin_url(img_url)
+                    if any(canonicalize_pin_url(p["image_url"]) == canon for p in pins):
+                        continue
                 pins.append({
                     "pin_id": pid,
                     "title": o.get("title") or o.get("grid_title") or o.get("alt_text") or "",
@@ -247,7 +248,7 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
             break
     return pins, pages
 
-# ---- Pidgets (public, no login)
+# ---- Pidgets (public, no login) — keep distinct IDs even if same image
 @st.cache_data(show_spinner=True)
 def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, max_pages: int = 20):
     path = _normalize_board_path(board_url)
@@ -257,10 +258,7 @@ def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, m
     params = {"page_size": str(page_size)}
     headers = build_headers(cookie=None, accept="application/json", referer=f"https://www.pinterest.com/{path}/")
 
-    pins, seen_keys, seen_urls, pages, bookmark = [], set(), set(), 0, None
-
-    def key_for(o, img_url):
-        return str(o.get("id")) if o.get("id") else img_url
+    pins, seen_ids, seen_urls, pages, bookmark = [], set(), set(), 0, None
 
     while len(pins) < want and pages < max_pages:
         q = params.copy()
@@ -280,17 +278,27 @@ def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, m
                     if isinstance(d, dict) and d.get("url"):
                         img_url = d["url"]; break
                 if not img_url: continue
+
+                pid = str(o.get("id")) if o.get("id") else None
                 canon = canonicalize_pin_url(img_url)
-                k = key_for(o, canon)
-                if k in seen_keys: continue
-                seen_keys.add(k); seen_urls.add(canon)
+
+                if pid:
+                    if pid in seen_ids: 
+                        continue
+                    seen_ids.add(pid)  # don't block on URL
+                else:
+                    if canon in seen_urls:
+                        continue
+                    seen_urls.add(canon)
+
                 pins.append({
-                    "pin_id": str(o.get("id")) if o.get("id") else None,
+                    "pin_id": pid,
                     "title": o.get("title") or o.get("grid_title") or o.get("alt_text") or "",
                     "description": o.get("description") or "",
                     "created_at": o.get("created_at") or o.get("created") or None,
                     "image_url": img_url,
                 })
+
             if not bookmark: break
         except Exception:
             break
@@ -378,7 +386,7 @@ def fetch_board_html_pages(board_url: str, max_items: int = 200, max_pages: int 
             continue
     return pins, pages
 
-# ---- Orchestrator (UNION + dedupe: keep distinct pin_ids even if same image)
+# ---- Orchestrator (UNION; keep distinct pin_ids even if same image)
 @st.cache_data(show_spinner=True)
 def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
     # HTML base
@@ -390,7 +398,7 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
 
     acc = []
     seen_ids: set[str] = set()
-    url_to_ids: dict[str, set[str]] = {}   # canonical URL -> set(pin_id) (may be empty for anon)
+    url_to_ids: dict[str, set[str]] = {}   # canonical URL -> set(pin_id)
     anon_urls: set[str] = set()            # URLs added without id
 
     def add_many(rows):
@@ -398,19 +406,16 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
         for p in rows:
             pid = str(p.get("pin_id")) if p.get("pin_id") else None
             url = canonicalize_pin_url(p.get("image_url"))
-            if not url: 
+            if not url:
                 continue
             if pid:
                 if pid in seen_ids:
                     continue
-                # keep even if same image already present for OTHER ids
                 seen_ids.add(pid)
                 url_to_ids.setdefault(url, set()).add(pid)
-                # if we previously added an anonymous entry with this URL, we ignore it going forward;
-                # (no need to remove from acc because we process anonymous sources later)
             else:
-                # anonymous: drop only if URL is already tied to any id OR already added anon
-                if url in url_to_ids and len(url_to_ids[url]) > 0:
+                # drop anonymous duplicates by URL, but only if an ID pin already has this URL
+                if url in url_to_ids and url_to_ids[url]:
                     continue
                 if url in anon_urls:
                     continue
@@ -700,7 +705,7 @@ radial_chart = alt.Chart(radial_df).mark_arc(stroke=None).encode(
 st.altair_chart(radial_chart, use_container_width=False)
 
 # ===============================
-# Hue × Value Explorer (tight, responsive thumbnails)
+# Hue × Value Explorer (tight, responsive thumbnails) — separated charts
 # ===============================
 
 st.subheader("Hue × Value Explorer (drag to filter & see pins)")
@@ -720,11 +725,11 @@ if not dom_df.empty:
         .add_params(brush)
         .properties(height=240)
     )
+    st.altair_chart(scatter, use_container_width=True)
 
-    # Thumbnail cell size (smaller than main gallery) — will shrink with container width
-    thumb_e = max(56, min(thumb_size, 100))  # tight by default
-    grid_cols = 12  # good default; chart scales to container width
-    # minimal gaps: zero band paddings + no axes
+    # Thumbnail grid (minimal gaps, responsive-ish)
+    thumb_e = max(56, min(thumb_size, 100))
+    grid_cols = 12
     thumbs = (
         alt.Chart(dom_df)
         .transform_filter(brush)
@@ -739,12 +744,12 @@ if not dom_df.empty:
             url="image_url:N",
             tooltip=["title:N"]
         )
-        .properties(width=grid_cols*thumb_e, height=thumb_e * (max(1, math.ceil(len(dom_df)/grid_cols))))
+        .properties(width=grid_cols*thumb_e,
+                    height=thumb_e * (max(1, math.ceil(len(dom_df)/grid_cols))))
         .configure_scale(bandPaddingInner=0, bandPaddingOuter=0)
         .configure_view(strokeWidth=0)
     )
-
-    st.altair_chart(alt.vconcat(scatter, thumbs).resolve_scale(color="independent"), use_container_width=True)
+    st.altair_chart(thumbs, use_container_width=True)
 else:
     st.info("No dominant-color points available for the explorer.")
 
