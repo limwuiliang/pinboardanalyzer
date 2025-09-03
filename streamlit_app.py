@@ -4,10 +4,11 @@
 # -------------------------------------------------------------
 # - Paste a PUBLIC Pinterest board URL and click Analyze.
 # - Only analyzes pins that BELONG to that board (excludes "More like this").
-# - If Pinterest's embedded JSON isn't accessible, falls back to board RSS.
-# - Color-true visuals: Master palette, Pin Gallery (CSS grid + hover overlay),
+# - Tries multiple board pages (?page=2..5) before RSS fallback.
+# - More robust image fetching (Referer header + 474x/236x variants).
+# - Visuals: Master palette, Pin Gallery (CSS grid + hover overlay),
 #   Hue histogram, Hue×Value Radial Map (smoothed).
-# - Diagnostics expander shows which method (JSON/RSS) was used.
+# - Diagnostics expander shows method and counts.
 # -------------------------------------------------------------
 
 import io
@@ -55,12 +56,35 @@ def rgb_to_hsv_np(rgb):
     v = mx
     return np.stack([h, s, v], axis=-1)
 
+# --- Pinterest image URL helpers ---
+
+PIN_SIZE_PATTERN = re.compile(r"/(orig(?:inals)?|[0-9]{3,4}x)/", re.IGNORECASE)
+
+def rewrite_pinimg_size(u: str, size: str) -> str:
+    """Rewrite a pinimg URL to a specific size directory (e.g., '474x', '236x')."""
+    if "i.pinimg.com" not in u:
+        return u
+    if PIN_SIZE_PATTERN.search(u):
+        return PIN_SIZE_PATTERN.sub(f"/{size}/", u)
+    # if no size segment present, try inserting before last path component
+    parts = u.split("/")
+    if len(parts) >= 5:
+        parts.insert(4, size)  # after domain and following three segments
+        return "/".join(parts)
+    return u
+
 @st.cache_data(show_spinner=False)
 def fetch_image_bytes(url, timeout=15):
+    """Fetch bytes with Pinterest-friendly headers."""
     try:
         r = requests.get(
-            url, timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+                "Referer": "https://www.pinterest.com/",
+            },
         )
         r.raise_for_status()
         return r.content
@@ -69,19 +93,31 @@ def fetch_image_bytes(url, timeout=15):
 
 @st.cache_data(show_spinner=False)
 def load_image_as_array(url, max_side=512):
-    data = fetch_image_bytes(url)
-    if not data:
-        return None
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            img = img.convert("RGB")
-            w, h = img.size
-            scale = max(w, h) / max_side if max(w, h) > max_side else 1
-            if scale > 1:
-                img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
-            return np.array(img)
-    except Exception:
-        return None
+    """
+    Try original URL; if it fails, try safer CDN size variants (474x, 236x).
+    """
+    candidates = [url]
+    if "i.pinimg.com" in url:
+        for size in ("474x", "236x", "736x"):
+            v = rewrite_pinimg_size(url, size)
+            if v not in candidates:
+                candidates.append(v)
+
+    for u in candidates:
+        data = fetch_image_bytes(u)
+        if not data:
+            continue
+        try:
+            with Image.open(io.BytesIO(data)) as img:
+                img = img.convert("RGB")
+                w, h = img.size
+                scale = max(w, h) / max_side if max(w, h) > max_side else 1
+                if scale > 1:
+                    img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+                return np.array(img)
+        except Exception:
+            continue
+    return None
 
 
 # ===============================
@@ -138,15 +174,15 @@ def _find_target_board_ids(data, target_path: str):
     return ids
 
 @st.cache_data(show_spinner=False)
-def extract_pins_from_html(html: str, board_url: str, max_pins: int = 200):
+def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
     """
     Extract ONLY pins that belong to the given board URL (exclude recommendations).
     Uses embedded JSON (__PWS_DATA__) and filters pins by board url/id.
     """
     target_path = _normalize_board_path(board_url)
-    m = re.search(r'<script[^>]+id="__PWS_DATA__"[^>]*>(.*?)</script>', html, flags=re.DOTALL | re.IGNORECASE)
+    m = re.search(r'<script[^>]+id="__PWS_DATA__"[^>]*>(.*?)</script>', html_text, flags=re.DOTALL | re.IGNORECASE)
     if not m:
-        return []  # can't safely separate without JSON
+        return []
     try:
         data = json.loads(m.group(1))
         target_ids = _find_target_board_ids(data, target_path)
@@ -157,10 +193,9 @@ def extract_pins_from_html(html: str, board_url: str, max_pins: int = 200):
                 images = o.get("images") or (o.get("image") if isinstance(o.get("image"), dict) else None)
                 img_url = None
                 if isinstance(images, dict):
-                    for key in ("orig", "736x", "474x", "170x", "small", "medium", "large"):
+                    for key in ("orig", "736x", "474x", "236x", "170x", "small", "medium", "large"):
                         if key in images and isinstance(images[key], dict) and images[key].get("url"):
                             img_url = images[key]["url"]; break
-                # determine belongs
                 belongs = False
                 burl = _obj_board_url(o)
                 if isinstance(burl, str) and target_path:
@@ -190,6 +225,7 @@ def extract_pins_from_html(html: str, board_url: str, max_pins: int = 200):
                     walk(v)
         walk(data)
 
+        # dedup & limit
         dedup, seen = [], set()
         for p in pins:
             url = p.get("image_url")
@@ -218,6 +254,7 @@ def fetch_board_rss(board_url: str, max_items: int = 200):
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+                "Referer": "https://www.pinterest.com/",
             },
         )
         if r.status_code != 200:
@@ -249,31 +286,59 @@ def fetch_board_rss(board_url: str, max_items: int = 200):
         return []
 
 @st.cache_data(show_spinner=True)
-def fetch_board_html(board_url: str) -> str:
+def fetch_board_html(url: str) -> str:
     r = requests.get(
-        board_url, timeout=20,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                 "Accept-Language": "en-US,en;q=0.9"},
+        url, timeout=20,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.pinterest.com/",
+        },
     )
     r.raise_for_status()
     return r.text
 
 @st.cache_data(show_spinner=True)
-def scrape_board_boardonly(board_url: str, max_pins: int = 200):
+def scrape_board_boardonly(board_url: str, max_pins: int = 200, max_pages: int = 5):
     """
     Strict board-only scrape:
-    1) Try embedded JSON (__PWS_DATA__) and filter to this board.
-    2) If none found, fall back to the board's RSS feed (board-only by design).
-    Returns (pins, source) where source is 'json' | 'rss' | 'none'.
+    1) Try embedded JSON (__PWS_DATA__) across multiple pages (?page=2..max_pages).
+    2) If still short, fall back to board RSS (board-only by design).
+    Returns (pins, source, pages_tried).
     """
-    html_doc = fetch_board_html(board_url)
-    pins = extract_pins_from_html(html_doc, board_url=board_url, max_pins=max_pins)
-    if pins:
-        return pins, "json"
-    pins = fetch_board_rss(board_url, max_items=max_pins)
-    if pins:
-        return pins, "rss"
-    return [], "none"
+    all_pins, seen = [], set()
+    pages_tried = 0
+    # try base + paginated pages
+    urls = [board_url] + [f"{board_url.rstrip('/')}/?page={p}" for p in range(2, max_pages+1)]
+    for u in urls:
+        pages_tried += 1
+        try:
+            html_doc = fetch_board_html(u)
+            pins = extract_pins_from_html(html_doc, board_url=board_url, max_pins=max_pins*2)
+            for p in pins:
+                url = p.get("image_url")
+                if url and url not in seen:
+                    all_pins.append(p); seen.add(url)
+                    if len(all_pins) >= max_pins:
+                        return all_pins, "json", pages_tried
+            # continue to next page until filled or pages exhausted
+        except Exception:
+            continue
+
+    # supplement via RSS if still short
+    if len(all_pins) < max_pins:
+        rss = fetch_board_rss(board_url, max_items=max_pins*2)
+        for p in rss:
+            url = p.get("image_url")
+            if url and url not in seen:
+                all_pins.append(p); seen.add(url)
+                if len(all_pins) >= max_pins:
+                    return all_pins, "json+rss", pages_tried
+
+    source = "json" if all_pins else "rss"
+    if not all_pins:
+        all_pins = fetch_board_rss(board_url, max_items=max_pins)
+    return all_pins[:max_pins], source, pages_tried
 
 
 # ===============================
@@ -300,9 +365,9 @@ if not board_url or "pinterest." not in urlparse(board_url).netloc:
     st.error("Please paste a valid public Pinterest board URL."); st.stop()
 
 # ---------------------------
-# Scrape (board-only, with fallback)
+# Scrape (board-only, multi-page + RSS fallback)
 # ---------------------------
-pins, source = scrape_board_boardonly(board_url, max_pins=pin_limit)
+pins, source, pages_tried = scrape_board_boardonly(board_url, max_pins=pin_limit, max_pages=5)
 if not pins:
     st.error("No pins found. The board may be private, region-limited, or its data is unavailable."); st.stop()
 pins_df = pd.DataFrame(pins)
@@ -312,9 +377,11 @@ pins_df = pd.DataFrame(pins)
 # ---------------------------
 progress = st.progress(0)
 records = []
+fetch_failures = 0
 for idx, row in pins_df.iterrows():
     arr = load_image_as_array(row["image_url"])
     if arr is None:
+        fetch_failures += 1
         continue
     pixels = arr.reshape(-1, 3)
     if pixels.shape[0] > 6000:
@@ -394,10 +461,10 @@ bar = (
 st.altair_chart(bar, use_container_width=True)
 
 # ---------------------------
-# Pin Gallery (CSS grid with hover overlay) — show ALL pins
+# Pin Gallery (CSS grid + hover overlay) — show ALL analyzed pins
 # ---------------------------
 st.subheader("Pin Gallery")
-st.caption(f"Showing {len(colors_df)} of {len(colors_df)} pins")
+st.caption(f"Showing {len(colors_df)} of {len(pins_df)} pins (image fetch failures: {fetch_failures})")
 
 # CSS for grid + overlay
 st.markdown(f"""
@@ -459,7 +526,6 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# Build cards for ALL pins in colors_df
 cards = []
 for _, r in colors_df.iterrows():
     t = html.escape((r.get("title") or "").strip())
@@ -508,21 +574,18 @@ st.altair_chart(hue_hist, use_container_width=True)
 # ---------------------------
 st.subheader("Hue × Value Radial Map (Smoothed)")
 
-# Prepare arrays for smoothing
 hv_h_deg = (pal_df["h"].to_numpy() * 360.0).astype(float)
 hv_v = pal_df["v"].to_numpy().astype(float)
 rgb_arr = pal_df[["r","g","b"]].to_numpy().astype(float)
 
-# Parameters for detail & smoothing
-H_STEPS = 72   # bins around the circle (every 5°)
-V_STEPS = 24   # radial bins from center (value 0) to edge (value 1)
+H_STEPS = 72   # 5° bins
+V_STEPS = 24   # radial bins
 SIGMA_H = 18.0 # degrees
-SIGMA_V = 0.12 # in [0..1]
-OUTER_R = 140  # px radius for the plot
-INNER_PAD = 24 # inner hole pad (px)
+SIGMA_V = 0.12 # 0..1
+OUTER_R = 140  # px
+INNER_PAD = 24 # px
 
 def smooth_color(h_center_deg, v_center):
-    # circular hue distance in degrees
     dh = np.abs(h_center_deg - hv_h_deg)
     dh = np.minimum(dh, 360.0 - dh)
     dv = np.abs(v_center - hv_v)
@@ -533,7 +596,6 @@ def smooth_color(h_center_deg, v_center):
     rgb = (rgb_arr * w[:, None]).sum(axis=0) / ws
     return hex_from_rgb(rgb)
 
-# Build dense polar grid of small arc segments
 theta_span = 360.0 / H_STEPS
 v_edges = np.linspace(0.0, 1.0, V_STEPS+1)
 v_centers = (v_edges[:-1] + v_edges[1:]) / 2
@@ -558,7 +620,6 @@ for v_c, v_lo, v_hi in zip(v_centers, v_edges[:-1], v_edges[1:]):
         })
 
 radial_df = pd.DataFrame(radial_rows)
-
 radial_chart = (
     alt.Chart(radial_df)
     .mark_arc(stroke=None)
@@ -578,4 +639,11 @@ st.altair_chart(radial_chart, use_container_width=False)
 # Diagnostics
 # ---------------------------
 with st.expander("🔧 Diagnostics"):
-    st.write({"board_url": board_url, "pins_found": int(len(pins_df)), "method": source})
+    st.write({
+        "board_url": board_url,
+        "pins_parsed": int(len(pins_df)),
+        "pins_processed": int(len(colors_df)),
+        "image_fetch_failures": int(fetch_failures),
+        "method": source,
+        "pages_tried": pages_tried,
+    })
