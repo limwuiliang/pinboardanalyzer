@@ -14,7 +14,7 @@ import streamlit as st
 import altair as alt
 
 # ===============================
-# Helpers
+# Utility helpers
 # ===============================
 
 def hex_from_rgb(rgb_tuple):
@@ -81,8 +81,8 @@ def _normalize_board_path(u: str):
     except Exception:
         return None
 
-# Convert numpy image -> small data URI (for Altair mark_image; avoids CORS)
 def array_to_data_uri(arr: np.ndarray, max_side: int = 112, fmt: str = "JPEG", quality: int = 78) -> str:
+    """Convert an RGB ndarray to a compact data URI (for Altair mark_image; avoids CORS)."""
     try:
         img = Image.fromarray(arr.astype(np.uint8))
         w, h = img.size
@@ -211,7 +211,6 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
         if len(dedup) >= max_pins: break
     return dedup, board_id
 
-# Public widgets
 @st.cache_data(show_spinner=True)
 def fetch_board_pidgets(board_url: str, want: int = 400, page_size: int = 100, max_pages: int = 20):
     path = _normalize_board_path(board_url)
@@ -246,14 +245,18 @@ def fetch_board_pidgets(board_url: str, want: int = 400, page_size: int = 100, m
                 else:
                     if canon in seen_urls: continue
                     seen_urls.add(canon)
-                pins.append({"pin_id": pid, "title": o.get("title") or "", "description": "",
-                             "created_at": o.get("created_at") or None, "image_url": img_url})
+                pins.append({
+                    "pin_id": pid,
+                    "title": o.get("title") or o.get("grid_title") or "",
+                    "description": "",
+                    "created_at": o.get("created_at") or None,
+                    "image_url": img_url,
+                })
             if not bookmark: break
         except Exception:
             break
     return pins, pages
 
-# RSS (older pins; parse <guid> / <link> for pin_id)
 def _parse_rss_batch(xml_text: str):
     try: root = ET.fromstring(xml_text)
     except Exception: return [], None
@@ -300,7 +303,8 @@ def fetch_board_rss_paginated(board_url: str, max_items: int = 400, max_pages: i
             while next_url and pages < max_pages and len(all_pins) < max_items:
                 r = requests.get(next_url, timeout=20, headers=build_headers(None, accept="application/rss+xml, application/xml;q=0.9, */*;q=0.8"))
                 if r.status_code != 200: break
-                batch, next_href = _parse_rss_batch(r.text); pages += 1
+                batch, next_href = _parse_rss_batch(r.text)
+                pages += 1
                 for pin in batch:
                     u = canonicalize_pin_url(pin.get("image_url"))
                     if u and u not in seen:
@@ -312,46 +316,6 @@ def fetch_board_rss_paginated(board_url: str, max_items: int = 400, max_pages: i
         return all_pins, pages
     except Exception:
         return [], 0
-
-# Cookie-enabled feed (lets us go past ~50 on many boards)
-@st.cache_data(show_spinner=True)
-def fetch_board_feed(board_url: str, board_id: str, cookie: str, want: int = 400, page_size: int = 100, max_pages: int = 12):
-    path = _normalize_board_path(board_url) or ""
-    source_url = f"/{path}/"
-    endpoint = "https://www.pinterest.com/resource/BoardFeedResource/get/"
-    pins, seen_ids, bookmark, pages = [], set(), None, 0
-
-    def params(book):
-        options = {"board_id": board_id, "page_size": page_size}
-        if book: options["bookmarks"] = [book]
-        data = {"options": options, "context": {}}
-        return {"source_url": source_url, "data": json.dumps(data, separators=(",",":"))}
-
-    while len(pins) < want and pages < max_pages:
-        try:
-            r = requests.get(endpoint, params=params(bookmark), headers=build_headers(cookie, accept="application/json"), timeout=20)
-            if r.status_code != 200: break
-            obj = r.json(); pages += 1
-            rr = obj.get("resource_response") or {}
-            data = rr.get("data") or []; bookmark = rr.get("bookmark")
-            for o in data:
-                images = o.get("images") or (o.get("image") if isinstance(o.get("image"), dict) else None)
-                img_url = None
-                if isinstance(images, dict):
-                    for key in ("orig","736x","474x","236x","170x","small","medium","large"):
-                        d = images.get(key)
-                        if isinstance(d, dict) and d.get("url"): img_url = d["url"]; break
-                if not img_url: continue
-                if str(o.get("board_id") or (o.get("board") or {}).get("id")) != str(board_id): continue
-                pid = str(o.get("id")) if o.get("id") else None
-                if pid and pid in seen_ids: continue
-                if pid: seen_ids.add(pid)
-                pins.append({"pin_id": pid, "title": o.get("title") or "", "description": "",
-                             "created_at": o.get("created_at") or None, "image_url": img_url})
-            if not bookmark: break
-        except Exception:
-            break
-    return pins, pages
 
 @st.cache_data(show_spinner=True)
 def fetch_board_html_pages(board_url: str, max_items: int = 400, max_pages: int = 10):
@@ -372,7 +336,6 @@ def fetch_board_html_pages(board_url: str, max_items: int = 400, max_pages: int 
             continue
     return pins, pages
 
-# Union orchestrator (board-only, keeps distinct pin_ids)
 @st.cache_data(show_spinner=True)
 def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 400):
     html_doc = fetch_board_html(board_url, cookie=cookie)
@@ -398,9 +361,6 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 400):
 
     sources = []
     if from_html: add_many(from_html); sources.append("json")
-    if cookie and board_id:  # only when cookie present
-        feed_pins, fp = fetch_board_feed(board_url, board_id, cookie, want=max_pins*2, page_size=100, max_pages=12)
-        if feed_pins: add_many(feed_pins); sources.append(f"feed({fp})")
     pidgets_pins, pp = fetch_board_pidgets(board_url, want=max_pins*2, page_size=100, max_pages=20)
     if pidgets_pins: add_many(pidgets_pins); sources.append(f"pidgets({pp})")
     rss_pins, rp = fetch_board_rss_paginated(board_url, max_items=max_pins*2, max_pages=12)
@@ -419,7 +379,6 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 400):
 
 st.set_page_config(page_title="Pinterest Board Color Analyzer", layout="wide")
 
-# Title (no link icon) + credit
 st.markdown("<h1 style='margin:0 0 0.25rem 0;font-weight:700;'>Pinterest Board Color Analyzer</h1>", unsafe_allow_html=True)
 st.caption("By: [Wui-Liang Lim](https://www.linkedin.com/in/limwuiliang/)")
 st.caption("Paste a **public** Pinterest board URL and click Analyze.")
@@ -433,20 +392,12 @@ with st.expander("Settings", expanded=False):
     thumb_size = st.slider("Pin thumbnail size (px)", 90, 200, 120, step=10)
 
 with st.expander("Advanced (optional)", expanded=False):
-    st.markdown("**Use a cookie to go beyond the ~50-pin public cap (if your board has more).**")
-    with st.expander("How to get your Pinterest cookie (Chrome)", expanded=False):
-        st.markdown("""
-1. Open **pinterest.com** and sign in.  
-2. Press **F12** (Windows/Linux) or **⌥⌘I** (Mac) → open **Network** tab.  
-3. Refresh. Click any request to `www.pinterest.com`.  
-4. In **Request Headers**, copy the entire **cookie:** line (e.g. `sb=…; _pinterest_sess=…; csrftoken=…; …`).  
-5. Paste it below. *Your cookie is used only for this run and not stored.*  
-        """)
+    st.markdown("**Use a cookie to go beyond the ~50-pin public cap.**")
+    st.markdown(
+        "1) Log into **pinterest.com** → DevTools (**F12/⌥⌘I**) → **Network** tab → refresh → click any request to `www.pinterest.com` → copy the whole **cookie:** header (e.g., `sb=…; _pinterest_sess=…; csrftoken=…; …`) → paste below."
+    )
     cookie_text = st.text_input("Cookie header", value="", type="password",
                                 placeholder="sb=...; _pinterest_sess=...; csrftoken=...; ...")
-    cookie_ok = bool(re.search(r"_pinterest_sess=.*csrftoken=", cookie_text))
-    st.caption(("✅ Cookie looks OK (found `_pinterest_sess` & `csrftoken`)."
-                if cookie_ok else "ℹ️ Optional. Add `_pinterest_sess` + `csrftoken` to fetch more than ~50 pins."))
     cookie = cookie_text or None
 
 if not st.button("Analyze"):
@@ -455,21 +406,20 @@ if not st.button("Analyze"):
 if not board_url or "pinterest." not in urlparse(board_url).netloc:
     st.error("Please paste a valid public Pinterest board URL."); st.stop()
 
-# ---- Scrape ----
+# ---- Scrape
 pins, meta = scrape_board_boardonly(board_url, cookie=cookie, max_pins=pin_limit*2)
 if not pins:
     st.error("No pins found. The board may be private or region-blocked."); st.stop()
 
 if (not cookie) and meta.get("board_pin_total") and meta["board_pin_total"] > len(pins):
     st.info(
-        f"This board reports **{meta['board_pin_total']}** pins. Public endpoints often cap near **50** without a cookie. "
-        "Add a cookie in **Advanced** to fetch the remainder."
+        f"This board reports **{meta['board_pin_total']}** pins. Public endpoints often cap near **50** without a cookie."
     )
 
 pins_df = pd.DataFrame(pins[:pin_limit])
 
 # ===============================
-# Color extraction (+ inline thumbnails for Explorer)
+# Color extraction (+ data-URI thumbnails for Explorer)
 # ===============================
 
 progress = st.progress(0); records, fetch_failures = [], 0
@@ -485,7 +435,7 @@ for idx, row in pins_df.iterrows():
     centers = km.cluster_centers_.astype(float)
     hsv = rgb_to_hsv_np(centers)
     hexes = [hex_from_rgb(c) for c in centers]
-    thumb_uri = array_to_data_uri(arr, max_side=112, fmt="JPEG", quality=78)
+    thumb_uri = array_to_data_uri(arr, max_side=112, fmt="JPEG", quality=78)  # CORS-free for Altair mark_image
     records.append({
         "pin_id": row.get("pin_id"),
         "image_url": row["image_url"],
@@ -502,7 +452,7 @@ if not records:
     st.error("Images could not be processed."); st.stop()
 colors_df = pd.DataFrame(records)
 
-# Long form + dominant rows
+# Long-form palette rows + dominant rows
 pal_rows, dom_rows = [], []
 for _, r in colors_df.iterrows():
     for i, hx in enumerate(r["palette_hex"]):
@@ -511,13 +461,13 @@ for _, r in colors_df.iterrows():
                          "hex": hx, "r": rgb[0], "g": rgb[1], "b": rgb[2], "h": hsv[0], "s": hsv[1], "v": hsv[2]})
     if r["palette_hsv"]:
         dh, _, dv = r["palette_hsv"][0]
-        dom_rows.append({"pin_id": r["pin_id"], "image_url": r["image_url"], "thumb": r["thumb_uri"], "title": r["title"],
+        dom_rows.append({"pin_id": r["pin_id"], "image_url": r["image_url"], "thumb_uri": r["thumb_uri"], "title": r["title"],
                          "h_deg": float(dh)*360.0, "v": float(dv), "hex": r["palette_hex"][0]})
 pal_df = pd.DataFrame(pal_rows)
 dom_df = pd.DataFrame(dom_rows)
 
 # ===============================
-# Master Palette (DESC)
+# Master Palette (DESC) + bar
 # ===============================
 
 st.subheader("Master Color Palette")
@@ -546,7 +496,6 @@ for i, hx in enumerate(master_hex_sorted):
 
 share_df = pd.DataFrame({"cluster_label":[f"C{i+1}" for i in range(len(master_hex_sorted))],
                          "count":counts_sorted, "hex":master_hex_sorted})
-# Sorted descending so labels match palette order
 st.altair_chart(
     alt.Chart(share_df).mark_bar(stroke="black", strokeWidth=0.25).encode(
         x=alt.X("cluster_label:N", sort='-y', title="Cluster (DESC)"),
@@ -558,7 +507,7 @@ st.altair_chart(
 )
 
 # ===============================
-# Pin Gallery (sorted by C1..)
+# Pin Gallery (minimal gaps, responsive)
 # ===============================
 
 def pin_cluster_rank(row):
@@ -606,7 +555,7 @@ for _, r in colors_df.sort_values(["cluster_rank","title"]).iterrows():
 st.markdown(f"<div class='pin-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
 # ===============================
-# Hue Histogram + Radial Map
+# Hue Distribution
 # ===============================
 
 st.subheader("Hue Distribution")
@@ -626,69 +575,15 @@ st.altair_chart(
     use_container_width=True
 )
 
-st.subheader("Hue × Value Radial Map (Smoothed)")
-hv_h = pal_df["h"].to_numpy()*360.0
-hv_v = pal_df["v"].to_numpy()
-rgb_arr = pal_df[["r","g","b"]].to_numpy()
-H_STEPS, V_STEPS, SIGMA_H, SIGMA_V, OUTER_R, INNER_PAD = 72, 24, 18.0, 0.12, 140, 24
-
-def smooth_color(hc, vc):
-    dh = np.abs(hc - hv_h); dh = np.minimum(dh, 360.0 - dh)
-    dv = np.abs(vc - hv_v)
-    w = np.exp(-(dh**2)/(2*SIGMA_H**2) - (dv**2)/(2*SIGMA_V**2))
-    ws = w.sum()
-    if ws <= 1e-9: return None
-    rgb = (rgb_arr * w[:,None]).sum(axis=0) / ws
-    return hex_from_rgb(rgb)
-
-theta_span = 360.0 / H_STEPS
-v_edges = np.linspace(0.0, 1.0, V_STEPS+1)
-v_centers = (v_edges[:-1] + v_edges[1:]) / 2
-h_centers = np.linspace(0.0, 360.0 - theta_span, H_STEPS)
-radial_rows = []
-for v_c, v_lo, v_hi in zip(v_centers, v_edges[:-1], v_edges[1:]):
-    inner = INNER_PAD + v_lo * OUTER_R
-    outer = INNER_PAD + v_hi * OUTER_R
-    for h_c in h_centers:
-        hx = smooth_color(h_c, v_c)
-        if not hx: continue
-        radial_rows.append({"theta": h_c - theta_span/2, "theta2": h_c + theta_span/2,
-                            "radius": inner, "radius2": outer, "hex": hx,
-                            "h_center": h_c, "v_center": float(v_c)})
-radial_df = pd.DataFrame(radial_rows)
-st.altair_chart(
-    alt.Chart(radial_df).mark_arc(stroke=None).encode(
-        theta="theta:Q", theta2="theta2:Q",
-        radius="radius:Q", radius2="radius2:Q",
-        color=alt.Color("hex:N", scale=None, legend=None),
-        tooltip=["h_center","v_center"],
-    ).properties(width=380, height=380),
-    use_container_width=False
-)
-
 # ===============================
-# Hue × Value Explorer
+# Hue × Value Explorer (ORIGINAL working pattern)
 # ===============================
 
 st.subheader("Hue × Value Explorer (drag to filter & see pins)")
 
-def render_thumb_grid(df, cols=14, size=56):
-    # data-URI thumbnails stacked as an HTML grid (tiny gaps)
-    n = len(df)
-    rows = max(1, math.ceil(n/cols))
-    cells = []
-    for _, r in df.iterrows():
-        uri = html.escape(r.get("thumb") or r.get("thumb_uri") or "")
-        title = html.escape(r.get("title") or "")
-        cells.append(f"<img src='{uri}' alt='{title}' width='{size}' height='{size}' style='object-fit:cover;border-radius:6px;border:1px solid #ddd;'>")
-    st.markdown(
-        f"<div style='display:grid;grid-template-columns:repeat({cols},{size}px);gap:2px;'>{''.join(cells)}</div>",
-        unsafe_allow_html=True
-    )
-
 if not dom_df.empty:
-    # Base scatter + selection
     brush = alt.selection_interval(encodings=["x","y"])
+
     scatter = (
         alt.Chart(dom_df)
         .mark_circle(size=60, opacity=0.9)
@@ -702,9 +597,10 @@ if not dom_df.empty:
         .properties(height=240)
     )
 
-    # Thumbnails chart (same Vega spec) — may fail on some Altair/vega-lite combos
-    thumb_e, grid_cols = 56, 14
-    thumbs_spec = (
+    # data-URI thumbnails; arranged into a compact grid
+    thumb_e = 56
+    grid_cols = 14
+    thumbs = (
         alt.Chart(dom_df)
         .transform_filter(brush)
         .transform_window(rn="row_number()")
@@ -713,7 +609,7 @@ if not dom_df.empty:
         .encode(
             x=alt.X("col:O", axis=None, sort=None, scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
             y=alt.Y("row:O", axis=None, sort=None, scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
-            url="thumb:N",
+            url="thumb_uri:N",
             tooltip=["title:N"],
         )
         .properties(width=grid_cols*thumb_e, height=thumb_e * (max(1, math.ceil(len(dom_df)/grid_cols))))
@@ -721,22 +617,8 @@ if not dom_df.empty:
         .configure_view(strokeWidth=0)
     )
 
-    # Try linked-spec first; if Altair rejects concat/vconcat, fall back to sliders + HTML grid
-    try:
-        explorer = alt.vconcat(scatter, thumbs_spec)  # one Vega spec so brush works
-        st.altair_chart(explorer, use_container_width=True)
-    except Exception:
-        st.warning("Interactive brush linking isn’t available in this environment. Using slider filter instead.")
-        st.altair_chart(scatter.properties(title=None), use_container_width=True)
-        # Fallback sliders drive the thumbnail grid
-        c1, c2 = st.columns(2)
-        with c1:
-            hue_range = st.slider("Hue range (°)", 0, 360, (0, 360), step=1)
-        with c2:
-            val_range = st.slider("Value range", 0.0, 1.0, (0.0, 1.0), step=0.01)
-        filtered = dom_df[(dom_df["h_deg"].between(hue_range[0], hue_range[1])) &
-                          (dom_df["v"].between(val_range[0], val_range[1]))]
-        render_thumb_grid(filtered.rename(columns={"thumb":"thumb_uri"}), cols=14, size=56)
+    explorer = alt.vconcat(scatter, thumbs)  # single spec -> brush works + images show
+    st.altair_chart(explorer, use_container_width=True)
 else:
     st.info("No dominant-color points available for the explorer.")
 
