@@ -95,53 +95,116 @@ def fetch_board_html(board_url: str) -> str:
     return r.text
 
 @st.cache_data(show_spinner=False)
-def extract_pins_from_html(html: str, max_pins: int = 200):
-    pins = []
-
-    # 1) Try the embedded JSON state first (script#__PWS_DATA__)
-    m = re.search(r'<script[^>]+id="__PWS_DATA__"[^>]*>(.*?)</script>', html, flags=re.DOTALL|re.IGNORECASE)
-    if m:
+def extract_pins_from_html(html: str, board_url: str, max_pins: int = 200):
+    """Extract ONLY pins that belong to the given board URL (exclude 'More like this')."""
+    def normalize_board_path(u: str):
         try:
-            blob = m.group(1)
-            data = json.loads(blob)
-
-            def walk(o):
-                if isinstance(o, dict):
-                    # Find images object shapes like { images: { orig: {url}, 736x: {url}, ... }, title, description, created_at }
-                    images = o.get('images') or (o.get('image') if isinstance(o.get('image'), dict) else None)
-                    img_url = None
-                    if isinstance(images, dict):
-                        for key in ('orig','736x','474x','170x','small','medium','large'):
-                            if key in images and isinstance(images[key], dict) and images[key].get('url'):
-                                img_url = images[key]['url']
-                                break
-                    title = o.get('title') or o.get('grid_title') or o.get('alt_text') or ''
-                    description = o.get('description') or o.get('grid_description') or ''
-                    created_at = o.get('created_at') or o.get('created') or None
-                    pin_id = o.get('id') or o.get('pin_id')
-                    if img_url:
-                        pins.append({
-                            'pin_id': str(pin_id) if pin_id else None,
-                            'title': title,
-                            'description': description,
-                            'created_at': created_at,
-                            'image_url': img_url,
-                        })
-                    for v in o.values():
-                        walk(v)
-                elif isinstance(o, list):
-                    for v in o:
-                        walk(v)
-            walk(data)
+            p = urlparse(u)
+            path = (p.path or '').lower().strip('/')
+            parts = [x for x in path.split('/') if x]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+            return path
         except Exception:
-            pass
+            return None
 
-    # 2) Fallback: regex any pinimg CDN URLs from the whole HTML
-    if not pins:
-        imgs = list({u for u in PINTEREST_IMG_RE.findall(html)})
-        pins = [{'pin_id': None, 'title': '', 'description': '', 'created_at': None, 'image_url': u} for u in imgs]
+    def find_target_board_ids(data, target_path: str):
+        ids = set()
+        def walk(o):
+            if isinstance(o, dict):
+                # any object with a board-like URL matching target path → collect ids
+                url = o.get('url') or o.get('board_url') or None
+                if isinstance(url, str):
+                    if target_path and target_path in (normalize_board_path(url) or ''):
+                        for k in ('id','board_id'):
+                            v = o.get(k)
+                            if isinstance(v, (str, int)):
+                                ids.add(str(v))
+                b = o.get('board')
+                if isinstance(b, dict):
+                    burl = b.get('url') or b.get('board_url')
+                    if isinstance(burl, str):
+                        if target_path and target_path in (normalize_board_path(burl) or ''):
+                            v = b.get('id')
+                            if isinstance(v, (str, int)):
+                                ids.add(str(v))
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+        walk(data)
+        return ids
 
-    # Deduplicate by image_url and trim
+    def obj_board_url(o):
+        if isinstance(o.get('board'), dict):
+            for k in ('url','board_url'):
+                if isinstance(o['board'].get(k), str):
+                    return o['board'][k]
+        for k in ('board_url','boardUrl','grid_board_url','gridBoardUrl'):
+            if isinstance(o.get(k), str):
+                return o.get(k)
+        return None
+
+    pins = []
+    target_path = normalize_board_path(board_url)
+
+    # Parse embedded JSON state
+    m = re.search(r'<script[^>]+id="__PWS_DATA__"[^>]*>(.*?)</script>', html, flags=re.DOTALL|re.IGNORECASE)
+    if not m:
+        return []  # no JSON → cannot safely separate recommendations
+
+    try:
+        blob = m.group(1)
+        data = json.loads(blob)
+        target_ids = find_target_board_ids(data, target_path)
+
+        def walk(o):
+            if isinstance(o, dict):
+                # Try to detect pins
+                images = o.get('images') or (o.get('image') if isinstance(o.get('image'), dict) else None)
+                img_url = None
+                if isinstance(images, dict):
+                    for key in ('orig','736x','474x','170x','small','medium','large'):
+                        if key in images and isinstance(images[key], dict) and images[key].get('url'):
+                            img_url = images[key]['url']
+                            break
+                title = o.get('title') or o.get('grid_title') or o.get('alt_text') or ''
+                description = o.get('description') or o.get('grid_description') or ''
+                created_at = o.get('created_at') or o.get('created') or None
+                pin_id = o.get('id') or o.get('pin_id')
+
+                # Determine if this pin belongs to the requested board
+                belongs = False
+                burl = obj_board_url(o)
+                if isinstance(burl, str) and target_path:
+                    if target_path in (normalize_board_path(burl) or ''):
+                        belongs = True
+                if not belongs:
+                    bid = o.get('board_id')
+                    if bid is None and isinstance(o.get('board'), dict):
+                        bid = o['board'].get('id')
+                    if bid is not None and str(bid) in target_ids:
+                        belongs = True
+
+                if img_url and belongs:
+                    pins.append({
+                        'pin_id': str(pin_id) if pin_id else None,
+                        'title': title,
+                        'description': description,
+                        'created_at': created_at,
+                        'image_url': img_url,
+                    })
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+        walk(data)
+    except Exception:
+        return []
+
+    # Deduplicate & trim
     dedup, seen = [], set()
     for p in pins:
         url = p.get('image_url')
@@ -155,7 +218,7 @@ def extract_pins_from_html(html: str, max_pins: int = 200):
 @st.cache_data(show_spinner=True)
 def scrape_board(board_url: str, max_pins: int = 200):
     html = fetch_board_html(board_url)
-    return extract_pins_from_html(html, max_pins=max_pins)
+    return extract_pins_from_html(html, board_url=board_url, max_pins=max_pins)
 
 # ===============================
 # Text tokens
