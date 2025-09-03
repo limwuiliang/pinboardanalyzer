@@ -2,15 +2,15 @@
 # -------------------------------------------------------------
 # Pinterest Board Color Analyzer — resilient board-only fetch
 # -------------------------------------------------------------
-# Sources (unioned, not either/or):
-#  1) HTML JSON (__PWS_DATA__) for early pins (+ board_id)
-#  2) BoardFeedResource (if cookie provided; fast + rich)
+# Sources (unioned):
+#  1) HTML JSON (__PWS_DATA__) + board_id
+#  2) BoardFeedResource (if cookie provided)
 #  3) Pidgets (public, no login) pagination  << main workhorse
-#  4) RSS with Atom rel="next" + ?num=100 fallback
-#  5) HTML ?page=2..10 (last resort)
-# Visuals: Master Palette (DESC, colored), Pin Gallery (sorted by C1..),
-#          Hue Histogram (colored), Hue × Value Radial Map (smoothed),
-#          Hue × Value Explorer (brush to show thumbnails).
+#  4) RSS with Atom rel="next" + ?num=100
+#  5) HTML ?page=2..10
+# Visuals: Master Palette (DESC), Pin Gallery (sorted by C1..),
+#          Hue Histogram (colored), Hue × Value Radial Map,
+#          Hue × Value Explorer (brush + tight, responsive thumbnails)
 # Strict board-only: excludes "More like this".
 # -------------------------------------------------------------
 
@@ -70,7 +70,6 @@ def build_headers(cookie: str | None, accept="*/*", referer="https://www.pintere
 
 # pinimg size rewrite + canonicalization for dedupe
 PIN_SIZE_PATTERN = re.compile(r"/(orig(?:inals)?|[0-9]{3,4}x)/", re.IGNORECASE)
-
 def rewrite_pinimg_size(u: str, size: str) -> str:
     if "i.pinimg.com" not in u: return u
     if PIN_SIZE_PATTERN.search(u): return PIN_SIZE_PATTERN.sub(f"/{size}/", u)
@@ -81,7 +80,6 @@ def rewrite_pinimg_size(u: str, size: str) -> str:
     return u
 
 def canonicalize_pin_url(u: str) -> str:
-    """Strip query + normalize size segment so same image dedupes across sources."""
     if not isinstance(u, str): return ""
     core = u.split("?")[0]
     if "i.pinimg.com" in core:
@@ -190,7 +188,6 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
     try: walk(data)
     except Exception: pass
 
-    # dedup & cap
     dedup, seen = [], set()
     for p in pins:
         u = p.get("image_url")
@@ -199,7 +196,7 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
         if len(dedup) >= max_pins: break
     return dedup, board_id
 
-# ---- BoardFeedResource (cookie-based; optional) ----
+# ---- BoardFeedResource (cookie-based; optional)
 @st.cache_data(show_spinner=True)
 def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200, page_size: int = 50, max_pages: int = 12):
     path = _normalize_board_path(board_url) or ""
@@ -232,7 +229,6 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
                 if str(o.get("board_id") or (o.get("board") or {}).get("id")) != str(board_id): continue
                 pid = str(o.get("id")) if o.get("id") else None
                 canon = canonicalize_pin_url(img_url)
-                # record both id & url to prevent cross-source dupes
                 if pid:
                     if pid in seen_ids: continue
                     seen_ids.add(pid); seen_urls.add(canon)
@@ -251,17 +247,12 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
             break
     return pins, pages
 
-# ---- Pidgets (public, no login) ----
+# ---- Pidgets (public, no login)
 @st.cache_data(show_spinner=True)
 def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, max_pages: int = 20):
-    """
-    Public JSON: https://widgets.pinterest.com/v3/pidgets/boards/<user>/<board>/pins/
-    Cursor-based pagination. No cookie required.
-    """
     path = _normalize_board_path(board_url)
     if not path:
         return [], 0
-
     base = f"https://widgets.pinterest.com/v3/pidgets/boards/{path}/pins/"
     params = {"page_size": str(page_size)}
     headers = build_headers(cookie=None, accept="application/json", referer=f"https://www.pinterest.com/{path}/")
@@ -273,33 +264,26 @@ def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, m
 
     while len(pins) < want and pages < max_pages:
         q = params.copy()
-        if bookmark:
-            q["bookmark"] = bookmark
+        if bookmark: q["bookmark"] = bookmark
         try:
             r = requests.get(base, params=q, headers=headers, timeout=20)
-            if r.status_code != 200:
-                break
-            obj = r.json()
-            pages += 1
+            if r.status_code != 200: break
+            obj = r.json(); pages += 1
             data = (obj.get("data") or {})
             bookmark = data.get("bookmark")
 
             for o in (data.get("pins") or []):
                 images = o.get("images") or {}
                 img_url = None
-                for sz in ("736x", "564x", "474x", "236x", "orig", "170x"):
+                for sz in ("736x","564x","474x","236x","orig","170x"):
                     d = images.get(sz)
                     if isinstance(d, dict) and d.get("url"):
                         img_url = d["url"]; break
-                if not img_url:
-                    continue
-
+                if not img_url: continue
                 canon = canonicalize_pin_url(img_url)
                 k = key_for(o, canon)
-                if k in seen_keys or canon in seen_urls:
-                    continue
+                if k in seen_keys: continue
                 seen_keys.add(k); seen_urls.add(canon)
-
                 pins.append({
                     "pin_id": str(o.get("id")) if o.get("id") else None,
                     "title": o.get("title") or o.get("grid_title") or o.get("alt_text") or "",
@@ -307,15 +291,13 @@ def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, m
                     "created_at": o.get("created_at") or o.get("created") or None,
                     "image_url": img_url,
                 })
-
-            if not bookmark:
-                break
+            if not bookmark: break
         except Exception:
             break
 
     return pins, pages
 
-# ---- RSS (paginated via Atom rel="next"; also try ?num=100) ----
+# ---- RSS (paginated)
 def _parse_rss_batch(xml_text: str):
     try:
         root = ET.fromstring(xml_text)
@@ -376,7 +358,7 @@ def fetch_board_rss_paginated(board_url: str, max_items: int = 200, max_pages: i
     except Exception:
         return [], 0
 
-# ---- HTML ?page=2..10 fallback ----
+# ---- HTML ?page=2..10 fallback
 @st.cache_data(show_spinner=True)
 def fetch_board_html_pages(board_url: str, max_items: int = 200, max_pages: int = 10):
     pins, seen, pages = [], set(), 0
@@ -396,20 +378,20 @@ def fetch_board_html_pages(board_url: str, max_items: int = 200, max_pages: int 
             continue
     return pins, pages
 
-# ---- Orchestrator (UNION + dedupe by pin_id then URL; always store URL too) ----
+# ---- Orchestrator (UNION + dedupe: keep distinct pin_ids even if same image)
 @st.cache_data(show_spinner=True)
 def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
-    """
-    Union results from multiple sources; keep unique pins by id (or canonical URL).
-    """
-    # 1) HTML base
+    # HTML base
     try:
         html_doc = fetch_board_html(board_url, cookie=cookie)
         from_html, board_id = extract_pins_from_html(html_doc, board_url, max_pins=max_pins*3)
     except Exception:
         from_html, board_id = [], None
 
-    acc, seen_ids, seen_urls = [], set(), set()
+    acc = []
+    seen_ids: set[str] = set()
+    url_to_ids: dict[str, set[str]] = {}   # canonical URL -> set(pin_id) (may be empty for anon)
+    anon_urls: set[str] = set()            # URLs added without id
 
     def add_many(rows):
         added = 0
@@ -418,17 +400,22 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
             url = canonicalize_pin_url(p.get("image_url"))
             if not url: 
                 continue
-            # block duplicates across sources/sizes
             if pid:
-                if pid in seen_ids: 
+                if pid in seen_ids:
                     continue
-                if url in seen_urls:
-                    continue
-                seen_ids.add(pid); seen_urls.add(url)
+                # keep even if same image already present for OTHER ids
+                seen_ids.add(pid)
+                url_to_ids.setdefault(url, set()).add(pid)
+                # if we previously added an anonymous entry with this URL, we ignore it going forward;
+                # (no need to remove from acc because we process anonymous sources later)
             else:
-                if url in seen_urls:
+                # anonymous: drop only if URL is already tied to any id OR already added anon
+                if url in url_to_ids and len(url_to_ids[url]) > 0:
                     continue
-                seen_urls.add(url)
+                if url in anon_urls:
+                    continue
+                anon_urls.add(url)
+                url_to_ids.setdefault(url, set())
             p["image_url"] = url
             acc.append(p)
             added += 1
@@ -440,24 +427,20 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
     if from_html:
         add_many(from_html); source_parts.append("json")
 
-    # 2) Cookie feed (if available)
     feed_pages = 0
     if board_id and cookie:
         feed_pins, feed_pages = fetch_board_feed(board_url, board_id, cookie=cookie, want=max_pins*3, page_size=50, max_pages=12)
         if feed_pins:
             add_many(feed_pins); source_parts.append("api")
 
-    # 3) Pidgets (public)
     pidgets_pins, pidgets_pages = fetch_board_pidgets(board_url, want=max_pins*3, page_size=100, max_pages=20)
     if pidgets_pins:
         add_many(pidgets_pins); source_parts.append("pidgets")
 
-    # 4) RSS
     rss_pins, rss_pages = fetch_board_rss_paginated(board_url, max_items=max_pins*3, max_pages=12)
     if rss_pins:
         add_many(rss_pins); source_parts.append("rss")
 
-    # 5) HTML pages
     html2_pins, html2_pages = fetch_board_html_pages(board_url, max_items=max_pins*3, max_pages=10)
     if html2_pins:
         add_many(html2_pins); source_parts.append("pages")
@@ -538,20 +521,17 @@ if not records:
     st.error("Images could not be processed."); st.stop()
 colors_df = pd.DataFrame(records)
 
-# Long-form palette rows for clustering across the board
-pal_rows = []
-dom_rows = []
+# Long-form palette rows + dominant rows
+pal_rows, dom_rows = [], []
 for _, r in colors_df.iterrows():
     for i, hx in enumerate(r["palette_hex"]):
         rgb = r["palette_rgb"][i]; hsv = r["palette_hsv"][i]
         pal_rows.append({"pin_id": r["pin_id"], "image_url": r["image_url"], "title": r["title"],
                          "hex": hx, "r": rgb[0], "g": rgb[1], "b": rgb[2], "h": hsv[0], "s": hsv[1], "v": hsv[2]})
-    # dominant only for explorer
     if r["palette_hsv"]:
         dh, ds, dv = r["palette_hsv"][0]
         dom_rows.append({"pin_id": r["pin_id"], "image_url": r["image_url"], "title": r["title"],
                          "h_deg": float(dh)*360.0, "v": float(dv), "hex": r["palette_hex"][0]})
-
 pal_df = pd.DataFrame(pal_rows)
 dom_df = pd.DataFrame(dom_rows)
 
@@ -561,25 +541,18 @@ dom_df = pd.DataFrame(dom_rows)
 
 st.subheader("Master Color Palette")
 
-# Fit master clusters on all RGBs
 all_rgb = pal_df[["r","g","b"]].to_numpy()
 master = KMeans(n_clusters=master_palette_k, n_init="auto", random_state=42).fit(all_rgb)
 centers = master.cluster_centers_.astype(float)
 master_hex = [hex_from_rgb(c) for c in centers]
 
-# Assign cluster indices to all palette colors
 pal_df["cluster"] = master.predict(all_rgb)
-
-# Count per cluster & sort desc
 counts = pal_df["cluster"].value_counts()
-order_idx = list(counts.sort_values(ascending=False).index)  # cluster ids sorted by share
-rank_map = {cid: rank for rank, cid in enumerate(order_idx)}  # cid -> 0..k-1
-
-# Reorder master palette arrays by descending share
+order_idx = list(counts.sort_values(ascending=False).index)
+rank_map = {cid: rank for rank, cid in enumerate(order_idx)}
 master_hex_sorted = [master_hex[cid] for cid in order_idx]
 counts_sorted = [int(counts.get(cid, 0)) for cid in order_idx]
 
-# Show swatches in DESC
 cols = st.columns(min(6, master_palette_k))
 for i, hx in enumerate(master_hex_sorted):
     with cols[i % len(cols)]:
@@ -590,7 +563,6 @@ for i, hx in enumerate(master_hex_sorted):
             unsafe_allow_html=True,
         )
 
-# DESC bar chart (colored by actual hex)
 share_df = pd.DataFrame(
     {"cluster_label": [f"C{i+1}" for i in range(len(master_hex_sorted))],
      "count": counts_sorted,
@@ -605,10 +577,9 @@ bar = alt.Chart(share_df).mark_bar(stroke="black", strokeWidth=0.25).encode(
 st.altair_chart(bar, use_container_width=True)
 
 # ===============================
-# Pin Gallery (sorted to match C1..)
+# Pin Gallery (sorted by C1..)
 # ===============================
 
-# Assign each PIN to a master cluster using its dominant RGB, then map to C-rank
 def pin_cluster_rank(row):
     if not row["palette_rgb"]:
         return 10**9
@@ -621,7 +592,6 @@ colors_df["cluster_rank"] = colors_df.apply(pin_cluster_rank, axis=1)
 st.subheader("Pin Gallery")
 st.caption(f"Showing {len(colors_df)} of {len(pins_df)} pins (image fetch failures: {fetch_failures}) — sorted by C1, C2, …")
 
-# CSS for grid + overlay
 st.markdown(f"""
 <style>
 .pin-grid {{
@@ -686,7 +656,7 @@ hue_hist = alt.Chart(h_bin_df).mark_bar(stroke="black", strokeWidth=0.25).encode
 st.altair_chart(hue_hist, use_container_width=True)
 
 # ===============================
-# Hue × Value Radial Map (smoothed; aesthetic)
+# Hue × Value Radial Map (Smoothed)
 # ===============================
 
 st.subheader("Hue × Value Radial Map (Smoothed)")
@@ -730,13 +700,14 @@ radial_chart = alt.Chart(radial_df).mark_arc(stroke=None).encode(
 st.altair_chart(radial_chart, use_container_width=False)
 
 # ===============================
-# Hue × Value Explorer (interactive thumbnails)
+# Hue × Value Explorer (tight, responsive thumbnails)
 # ===============================
 
 st.subheader("Hue × Value Explorer (drag to filter & see pins)")
+
 if not dom_df.empty:
-    # Scatter with brush selection
     brush = alt.selection_interval(encodings=["x","y"])
+
     scatter = (
         alt.Chart(dom_df)
         .mark_circle(size=60, opacity=0.9)
@@ -750,21 +721,27 @@ if not dom_df.empty:
         .properties(height=240)
     )
 
-    # Image panel filtered by brush; lay out in a grid using window + calculate
-    grid_cols = 8
+    # Thumbnail cell size (smaller than main gallery) — will shrink with container width
+    thumb_e = max(56, min(thumb_size, 100))  # tight by default
+    grid_cols = 12  # good default; chart scales to container width
+    # minimal gaps: zero band paddings + no axes
     thumbs = (
         alt.Chart(dom_df)
         .transform_filter(brush)
         .transform_window(rn="row_number()")
         .transform_calculate(col=f"datum.rn % {grid_cols}", row=f"floor(datum.rn / {grid_cols})")
-        .mark_image(width=90, height=90)
+        .mark_image(width=thumb_e, height=thumb_e)
         .encode(
-            x=alt.X("col:O", axis=None),
-            y=alt.Y("row:O", axis=None),
+            x=alt.X("col:O", axis=None, sort=None,
+                    scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
+            y=alt.Y("row:O", axis=None, sort=None,
+                    scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
             url="image_url:N",
             tooltip=["title:N"]
         )
-        .properties(height= ((len(dom_df)//grid_cols)+1)*90, width=grid_cols*90)
+        .properties(width=grid_cols*thumb_e, height=thumb_e * (max(1, math.ceil(len(dom_df)/grid_cols))))
+        .configure_scale(bandPaddingInner=0, bandPaddingOuter=0)
+        .configure_view(strokeWidth=0)
     )
 
     st.altair_chart(alt.vconcat(scatter, thumbs).resolve_scale(color="independent"), use_container_width=True)
