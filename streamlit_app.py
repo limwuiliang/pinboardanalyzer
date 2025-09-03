@@ -364,8 +364,8 @@ def scrape_board_boardonly(board_url: str, max_pins: int = 200):
 # Streamlit App — Clean UI
 # ===============================
 
-st.set_page_config(page_title="Pinterest Color & Trend Analyzer", layout="wide")
-st.title("🎯 Pinterest Board — Color & Trend Analyzer")
+st.set_page_config(page_title="Pinterest Color Analyzer", layout="wide")
+st.title("🎯 Pinterest Board — Color Analyzer")
 st.caption("Paste a **public** Pinterest board URL and click Analyze.")
 
 board_url = st.text_input("Pinterest board URL", placeholder="https://www.pinterest.com/<username>/<board-slug>/")
