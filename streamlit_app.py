@@ -4,30 +4,22 @@
 # -------------------------------------------------------------
 # - Paste a PUBLIC Pinterest board URL and click Analyze.
 # - Only analyzes pins that BELONG to that board (excludes "More like this").
-# - Tries multiple board pages (?page=2..5) before RSS fallback.
-# - More robust image fetching (Referer header + 474x/236x variants).
-# - Visuals: Master palette, Pin Gallery (CSS grid + hover overlay),
-#   Hue histogram, Hue×Value Radial Map (smoothed).
-# - Diagnostics expander shows method and counts.
+# - NEW: Paginates the board feed via Pinterest's BoardFeedResource to fetch >25 pins.
+# - Robust image fetching (Referer + size variants).
+# - Visuals: Master palette, Pin Gallery (CSS grid + hover overlay), Hue histogram,
+#            Hue×Value Radial Map (smoothed).
+# - Diagnostics shows counts, method, pages, API pages.
 # -------------------------------------------------------------
 
-import io
-import re
-import math
-import json
-import xml.etree.ElementTree as ET
-import html
-from urllib.parse import urlparse
+import io, re, math, json, html, xml.etree.ElementTree as ET
+from urllib.parse import urlparse, quote
 
-import requests
-import numpy as np
-import pandas as pd
+import requests, numpy as np, pandas as pd
 from PIL import Image
 from sklearn.cluster import KMeans
 
 import streamlit as st
 import altair as alt
-
 
 # ===============================
 # Utilities
@@ -38,48 +30,40 @@ def hex_from_rgb(rgb_tuple):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 def rgb_to_hsv_np(rgb):
-    """RGB [0-255] -> HSV [0-1], vectorized."""
     rgb = np.asarray(rgb, dtype=np.float32) / 255.0
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    mx = np.max(rgb, axis=-1); mn = np.min(rgb, axis=-1)
+    r, g, b = rgb[...,0], rgb[...,1], rgb[...,2]
+    mx, mn = np.max(rgb, axis=-1), np.min(rgb, axis=-1)
     diff = mx - mn
     h = np.zeros_like(mx)
     mask = diff != 0
-    r_eq = (mx == r) & mask
-    g_eq = (mx == g) & mask
-    b_eq = (mx == b) & mask
-    h[r_eq] = ((g[r_eq] - b[r_eq]) / diff[r_eq]) % 6
-    h[g_eq] = ((b[g_eq] - r[g_eq]) / diff[g_eq]) + 2
-    h[b_eq] = ((r[b_eq] - g[b_eq]) / diff[b_eq]) + 4
-    h = (h / 6.0) % 1.0
-    s = np.where(mx == 0, 0, diff / mx)
+    r_eq, g_eq, b_eq = (mx==r)&mask, (mx==g)&mask, (mx==b)&mask
+    h[r_eq] = ((g[r_eq]-b[r_eq])/diff[r_eq]) % 6
+    h[g_eq] = ((b[g_eq]-r[g_eq])/diff[g_eq]) + 2
+    h[b_eq] = ((r[b_eq]-g[b_eq])/diff[b_eq]) + 4
+    h = (h/6.0) % 1.0
+    s = np.where(mx==0, 0, diff/mx)
     v = mx
-    return np.stack([h, s, v], axis=-1)
+    return np.stack([h,s,v], axis=-1)
 
 # --- Pinterest image URL helpers ---
-
 PIN_SIZE_PATTERN = re.compile(r"/(orig(?:inals)?|[0-9]{3,4}x)/", re.IGNORECASE)
 
 def rewrite_pinimg_size(u: str, size: str) -> str:
-    """Rewrite a pinimg URL to a specific size directory (e.g., '474x', '236x')."""
     if "i.pinimg.com" not in u:
         return u
     if PIN_SIZE_PATTERN.search(u):
         return PIN_SIZE_PATTERN.sub(f"/{size}/", u)
-    # if no size segment present, try inserting before last path component
     parts = u.split("/")
     if len(parts) >= 5:
-        parts.insert(4, size)  # after domain and following three segments
+        parts.insert(4, size)
         return "/".join(parts)
     return u
 
 @st.cache_data(show_spinner=False)
 def fetch_image_bytes(url, timeout=15):
-    """Fetch bytes with Pinterest-friendly headers."""
     try:
         r = requests.get(
-            url,
-            timeout=timeout,
+            url, timeout=timeout,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
@@ -93,16 +77,12 @@ def fetch_image_bytes(url, timeout=15):
 
 @st.cache_data(show_spinner=False)
 def load_image_as_array(url, max_side=512):
-    """
-    Try original URL; if it fails, try safer CDN size variants (474x, 236x).
-    """
     candidates = [url]
     if "i.pinimg.com" in url:
-        for size in ("474x", "236x", "736x"):
+        for size in ("474x","236x","736x"):
             v = rewrite_pinimg_size(url, size)
             if v not in candidates:
                 candidates.append(v)
-
     for u in candidates:
         data = fetch_image_bytes(u)
         if not data:
@@ -111,7 +91,7 @@ def load_image_as_array(url, max_side=512):
             with Image.open(io.BytesIO(data)) as img:
                 img = img.convert("RGB")
                 w, h = img.size
-                scale = max(w, h) / max_side if max(w, h) > max_side else 1
+                scale = max(w,h)/max_side if max(w,h) > max_side else 1
                 if scale > 1:
                     img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
                 return np.array(img)
@@ -119,13 +99,11 @@ def load_image_as_array(url, max_side=512):
             continue
     return None
 
-
 # ===============================
-# Scraper (board-only)
+# Scraper (board-only, paginated)
 # ===============================
 
 PINTEREST_IMG_RE = re.compile(r'https?://i\.pinimg\.com/[^\s">]+\.(?:jpg|jpeg|png|webp)')
-
 def _normalize_board_path(u: str):
     try:
         p = urlparse(u)
@@ -135,16 +113,13 @@ def _normalize_board_path(u: str):
         return None
 
 def _obj_board_url(o: dict):
-    if not isinstance(o, dict):
-        return None
+    if not isinstance(o, dict): return None
     b = o.get("board")
     if isinstance(b, dict):
-        for k in ("url", "board_url"):
-            if isinstance(b.get(k), str):
-                return b.get(k)
-    for k in ("board_url", "boardUrl", "grid_board_url", "gridBoardUrl"):
-        if isinstance(o.get(k), str):
-            return o.get(k)
+        for k in ("url","board_url"):
+            if isinstance(b.get(k), str): return b.get(k)
+    for k in ("board_url","boardUrl","grid_board_url","gridBoardUrl"):
+        if isinstance(o.get(k), str): return o.get(k)
     return None
 
 def _find_target_board_ids(data, target_path: str):
@@ -154,46 +129,47 @@ def _find_target_board_ids(data, target_path: str):
             url = o.get("url") or o.get("board_url")
             if isinstance(url, str):
                 if target_path and target_path == (_normalize_board_path(url) or ""):
-                    for k in ("id", "board_id"):
+                    for k in ("id","board_id"):
                         v = o.get(k)
-                        if isinstance(v, (str, int)):
-                            ids.add(str(v))
+                        if isinstance(v, (str,int)): ids.add(str(v))
             b = o.get("board")
             if isinstance(b, dict):
                 burl = b.get("url") or b.get("board_url")
                 if isinstance(burl, str) and target_path == (_normalize_board_path(burl) or ""):
                     v = b.get("id")
-                    if isinstance(v, (str, int)):
-                        ids.add(str(v))
-            for v in o.values():
-                walk(v)
+                    if isinstance(v, (str,int)): ids.add(str(v))
+            for v in o.values(): walk(v)
         elif isinstance(o, list):
-            for v in o:
-                walk(v)
+            for v in o: walk(v)
     walk(data)
     return ids
 
+def _extract_board_id(html_text: str):
+    # Try common patterns inside __PWS_DATA__ blob
+    m = re.search(r'"board_id":"(\d+)"', html_text)
+    if m: return m.group(1)
+    m = re.search(r'"board":{"id":"(\d+)"', html_text)
+    if m: return m.group(1)
+    m = re.search(r'"id":"(\d+)"\s*,\s*"owner"', html_text)
+    if m: return m.group(1)
+    return None
+
 @st.cache_data(show_spinner=False)
 def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
-    """
-    Extract ONLY pins that belong to the given board URL (exclude recommendations).
-    Uses embedded JSON (__PWS_DATA__) and filters pins by board url/id.
-    """
     target_path = _normalize_board_path(board_url)
-    m = re.search(r'<script[^>]+id="__PWS_DATA__"[^>]*>(.*?)</script>', html_text, flags=re.DOTALL | re.IGNORECASE)
-    if not m:
-        return []
+    m = re.search(r'<script[^>]+id="__PWS_DATA__"[^>]*>(.*?)</script>', html_text, flags=re.DOTALL|re.IGNORECASE)
+    if not m: return [], None
     try:
         data = json.loads(m.group(1))
         target_ids = _find_target_board_ids(data, target_path)
-        pins = []
+        pins, board_id = [], _extract_board_id(m.group(1))
 
         def walk(o):
             if isinstance(o, dict):
                 images = o.get("images") or (o.get("image") if isinstance(o.get("image"), dict) else None)
                 img_url = None
                 if isinstance(images, dict):
-                    for key in ("orig", "736x", "474x", "236x", "170x", "small", "medium", "large"):
+                    for key in ("orig","736x","474x","236x","170x","small","medium","large"):
                         if key in images and isinstance(images[key], dict) and images[key].get("url"):
                             img_url = images[key]["url"]; break
                 belongs = False
@@ -211,18 +187,12 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
                     title = o.get("title") or o.get("grid_title") or o.get("alt_text") or ""
                     description = o.get("description") or o.get("grid_description") or ""
                     created_at = o.get("created_at") or o.get("created") or None
-                    pins.append({
-                        "pin_id": str(pin_id) if pin_id else None,
-                        "title": title,
-                        "description": description,
-                        "created_at": created_at,
-                        "image_url": img_url,
-                    })
-                for v in o.values():
-                    walk(v)
+                    pins.append({"pin_id": str(pin_id) if pin_id else None,
+                                 "title": title, "description": description,
+                                 "created_at": created_at, "image_url": img_url})
+                for v in o.values(): walk(v)
             elif isinstance(o, list):
-                for v in o:
-                    walk(v)
+                for v in o: walk(v)
         walk(data)
 
         # dedup & limit
@@ -231,23 +201,29 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
             url = p.get("image_url")
             if url and url not in seen:
                 dedup.append(p); seen.add(url)
-            if len(dedup) >= max_pins:
-                break
-        return dedup
+            if len(dedup) >= max_pins: break
+        return dedup, board_id
     except Exception:
-        return []
+        return [], None
+
+@st.cache_data(show_spinner=True)
+def fetch_board_html(url: str) -> str:
+    r = requests.get(
+        url, timeout=20,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.pinterest.com/",
+        },
+    ); r.raise_for_status()
+    return r.text
 
 @st.cache_data(show_spinner=True)
 def fetch_board_rss(board_url: str, max_items: int = 200):
-    """
-    Fallback: fetch the board's RSS feed and extract image URLs from official pins only.
-    Example: https://www.pinterest.com/<username>/<board-slug>.rss
-    """
     try:
         p = urlparse(board_url)
         parts = [x for x in (p.path or "").strip("/").split("/") if x]
-        if len(parts) < 2:
-            return []
+        if len(parts) < 2: return []
         rss_url = f"{p.scheme}://{p.netloc}/{parts[0]}/{parts[1]}.rss"
         r = requests.get(
             rss_url, timeout=20,
@@ -257,12 +233,9 @@ def fetch_board_rss(board_url: str, max_items: int = 200):
                 "Referer": "https://www.pinterest.com/",
             },
         )
-        if r.status_code != 200:
-            return []
-        root = ET.fromstring(r.text)
-        ns = {"media": "http://search.yahoo.com/mrss/"}
-        items = root.findall(".//item")
-        pins = []
+        if r.status_code != 200: return []
+        root = ET.fromstring(r.text); ns = {"media":"http://search.yahoo.com/mrss/"}
+        items = root.findall(".//item"); pins = []
         for it in items[:max_items]:
             title_el = it.find("title"); title = title_el.text if title_el is not None else ""
             pub_el = it.find("pubDate"); created_at = pub_el.text if pub_el is not None else None
@@ -277,72 +250,129 @@ def fetch_board_rss(board_url: str, max_items: int = 200):
                 if encl is not None: img_url = encl.attrib.get("url")
             if not img_url:
                 desc_el = it.find("description"); desc = desc_el.text if desc_el is not None else ""
-                m = PINTEREST_IMG_RE.search(desc or "")
+                m = PINTEREST_IMG_RE.search(desc or ""); 
                 if m: img_url = m.group(0)
             if img_url:
-                pins.append({"pin_id": None, "title": title, "description": "", "created_at": created_at, "image_url": img_url})
+                pins.append({"pin_id": None, "title": title, "description": "",
+                             "created_at": created_at, "image_url": img_url})
         return pins
     except Exception:
         return []
 
+# -------- NEW: BoardFeedResource pagination (internal API, no login) --------
 @st.cache_data(show_spinner=True)
-def fetch_board_html(url: str) -> str:
-    r = requests.get(
-        url, timeout=20,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.pinterest.com/",
-        },
-    )
-    r.raise_for_status()
-    return r.text
+def fetch_board_feed(board_url: str, board_id: str, want: int = 200, page_size: int = 50, max_api_pages: int = 10):
+    """
+    Call Pinterest's BoardFeedResource to retrieve many pins.
+    Returns (pins, api_pages).
+    """
+    # Build source_url from user/board path
+    path = _normalize_board_path(board_url) or ""
+    source_url = f"/{path}/"
+    endpoint = "https://www.pinterest.com/resource/BoardFeedResource/get/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.pinterest.com{source_url}",
+    }
+
+    pins, seen = [], set()
+    bookmark = None
+    api_pages = 0
+
+    def to_params(bookmark_val):
+        options = {"board_id": board_id, "page_size": page_size}
+        if bookmark_val: options["bookmarks"] = [bookmark_val]
+        data = {"options": options, "context": {}}
+        return {
+            "source_url": source_url,
+            "data": json.dumps(data, separators=(",", ":")),
+        }
+
+    while len(pins) < want and api_pages < max_api_pages:
+        params = to_params(bookmark)
+        try:
+            r = requests.get(endpoint, params=params, headers=headers, timeout=20)
+            if r.status_code != 200:
+                break
+            obj = r.json()
+            api_pages += 1
+            # path: resource_response -> data (array of pins), bookmark (str or None)
+            rr = obj.get("resource_response") or {}
+            data = rr.get("data") or []
+            bookmark = rr.get("bookmark")  # None or token string
+
+            for o in data:
+                images = o.get("images") or (o.get("image") if isinstance(o.get("image"), dict) else None)
+                img_url = None
+                if isinstance(images, dict):
+                    for key in ("orig","736x","474x","236x","170x","small","medium","large"):
+                        d = images.get(key)
+                        if isinstance(d, dict) and d.get("url"): img_url = d["url"]; break
+                if not img_url: continue
+                # Board-only guard
+                bid = o.get("board_id") or (o.get("board",{}) or {}).get("id")
+                if board_id and str(bid) != str(board_id):
+                    continue
+                if img_url in seen: continue
+                seen.add(img_url)
+                pins.append({
+                    "pin_id": str(o.get("id")) if o.get("id") else None,
+                    "title": o.get("title") or o.get("grid_title") or o.get("alt_text") or "",
+                    "description": o.get("description") or o.get("grid_description") or "",
+                    "created_at": o.get("created_at") or o.get("created") or None,
+                    "image_url": img_url,
+                })
+            if not bookmark:
+                break
+        except Exception:
+            break
+
+    return pins, api_pages
 
 @st.cache_data(show_spinner=True)
-def scrape_board_boardonly(board_url: str, max_pins: int = 200, max_pages: int = 5):
+def scrape_board_boardonly(board_url: str, max_pins: int = 200):
     """
     Strict board-only scrape:
-    1) Try embedded JSON (__PWS_DATA__) across multiple pages (?page=2..max_pages).
-    2) If still short, fall back to board RSS (board-only by design).
-    Returns (pins, source, pages_tried).
+      1) Parse initial HTML (__PWS_DATA__) for first pins + board_id
+      2) Use BoardFeedResource pagination to fetch more pins (no login)
+      3) If still short, fall back to RSS
+    Returns (pins, source, pages_tried_html, api_pages)
     """
     all_pins, seen = [], set()
-    pages_tried = 0
-    # try base + paginated pages
-    urls = [board_url] + [f"{board_url.rstrip('/')}/?page={p}" for p in range(2, max_pages+1)]
-    for u in urls:
-        pages_tried += 1
-        try:
-            html_doc = fetch_board_html(u)
-            pins = extract_pins_from_html(html_doc, board_url=board_url, max_pins=max_pins*2)
-            for p in pins:
-                url = p.get("image_url")
-                if url and url not in seen:
-                    all_pins.append(p); seen.add(url)
-                    if len(all_pins) >= max_pins:
-                        return all_pins, "json", pages_tried
-            # continue to next page until filled or pages exhausted
-        except Exception:
-            continue
+    pages_tried_html = 1  # base HTML only
+    html_doc = fetch_board_html(board_url)
+    initial, board_id = extract_pins_from_html(html_doc, board_url=board_url, max_pins=max_pins*2)
+    for p in initial:
+        u = p.get("image_url")
+        if u and u not in seen:
+            all_pins.append(p); seen.add(u)
+    source = "json" if all_pins else "none"
 
-    # supplement via RSS if still short
+    # Try internal API pagination if we have board_id
+    api_pages = 0
+    if board_id and len(all_pins) < max_pins:
+        more, api_pages = fetch_board_feed(board_url, board_id, want=max_pins*2, page_size=50, max_api_pages=10)
+        for p in more:
+            u = p.get("image_url")
+            if u and u not in seen:
+                all_pins.append(p); seen.add(u)
+        if more: source = "json+api"
+
+    # RSS supplement as last resort
     if len(all_pins) < max_pins:
         rss = fetch_board_rss(board_url, max_items=max_pins*2)
         for p in rss:
-            url = p.get("image_url")
-            if url and url not in seen:
-                all_pins.append(p); seen.add(url)
-                if len(all_pins) >= max_pins:
-                    return all_pins, "json+rss", pages_tried
+            u = p.get("image_url")
+            if u and u not in seen:
+                all_pins.append(p); seen.add(u)
+        if rss and source == "none": source = "rss"
 
-    source = "json" if all_pins else "rss"
-    if not all_pins:
-        all_pins = fetch_board_rss(board_url, max_items=max_pins)
-    return all_pins[:max_pins], source, pages_tried
-
+    return all_pins[:max_pins], source, pages_tried_html, api_pages
 
 # ===============================
-# Streamlit App — Clean UI
+# Streamlit App (UI + visuals below are unchanged from your latest)
 # ===============================
 
 st.set_page_config(page_title="Pinterest Color & Trend Analyzer", layout="wide")
@@ -351,66 +381,55 @@ st.caption("Paste a **public** Pinterest board URL and click Analyze.")
 
 board_url = st.text_input("Pinterest board URL", placeholder="https://www.pinterest.com/<username>/<board-slug>/")
 
-with st.expander("Options", expanded=False):
+with st.expander("Settings", expanded=False):
     pin_limit = st.slider("Max pins to analyze", 20, 500, 120, step=10)
     palette_k = st.slider("Colors per image (KMeans)", 3, 8, 5)
     master_palette_k = st.slider("Master palette size (across board)", 5, 20, 10)
     thumb_size = st.slider("Pin thumbnail size (px)", 90, 200, 120, step=10)
 
-analyze = st.button("Analyze")
-if not analyze:
+if not st.button("Analyze"):
     st.stop()
 
 if not board_url or "pinterest." not in urlparse(board_url).netloc:
     st.error("Please paste a valid public Pinterest board URL."); st.stop()
 
-# ---------------------------
-# Scrape (board-only, multi-page + RSS fallback)
-# ---------------------------
-pins, source, pages_tried = scrape_board_boardonly(board_url, max_pins=pin_limit, max_pages=5)
+# ---------- Scrape using new paginator ----------
+pins, source, pages_tried_html, api_pages = scrape_board_boardonly(board_url, max_pins=pin_limit)
 if not pins:
     st.error("No pins found. The board may be private, region-limited, or its data is unavailable."); st.stop()
 pins_df = pd.DataFrame(pins)
 
-# ---------------------------
-# Palette extraction per pin
-# ---------------------------
-progress = st.progress(0)
-records = []
-fetch_failures = 0
+# ---------- Palette extraction ----------
+progress = st.progress(0); records = []; fetch_failures = 0
 for idx, row in pins_df.iterrows():
     arr = load_image_as_array(row["image_url"])
     if arr is None:
-        fetch_failures += 1
-        continue
-    pixels = arr.reshape(-1, 3)
+        fetch_failures += 1; continue
+    pixels = arr.reshape(-1,3)
     if pixels.shape[0] > 6000:
         sel = np.random.RandomState(42).choice(pixels.shape[0], 6000, replace=False)
         pixels = pixels[sel]
-    kmeans = KMeans(n_clusters=palette_k, n_init="auto", random_state=42)
-    kmeans.fit(pixels)
-    centers = kmeans.cluster_centers_.astype(float)
+    km = KMeans(n_clusters=palette_k, n_init="auto", random_state=42).fit(pixels)
+    centers = km.cluster_centers_.astype(float)
     hsv = rgb_to_hsv_np(centers)
     hexes = [hex_from_rgb(c) for c in centers]
     records.append({
         "pin_id": row.get("pin_id"),
         "image_url": row["image_url"],
-        "title": row.get("title", ""),
-        "description": row.get("description", ""),
+        "title": row.get("title",""),
+        "description": row.get("description",""),
         "created_at": row.get("created_at"),
-        "palette_hex": hexes,
-        "palette_rgb": centers.tolist(),
-        "palette_hsv": hsv.tolist(),
-        "dominant_hex": hexes[0] if hexes else None,
+        "palette_hex": hexes, "palette_rgb": centers.tolist(),
+        "palette_hsv": hsv.tolist(), "dominant_hex": hexes[0] if hexes else None,
     })
-    progress.progress(min(1.0, (len(records) / len(pins_df))))
+    progress.progress(min(1.0, (len(records)/len(pins_df))))
 progress.empty()
 if not records:
     st.error("Images could not be processed. Try another public board."); st.stop()
 
 colors_df = pd.DataFrame(records)
 
-# Expand palettes to long form
+# ---------- Long palette df ----------
 pal_rows = []
 for _, r in colors_df.iterrows():
     for i, hx in enumerate(r["palette_hex"]):
@@ -419,18 +438,15 @@ for _, r in colors_df.iterrows():
                          "hex": hx, "r": rgb[0], "g": rgb[1], "b": rgb[2], "h": hsv[0], "s": hsv[1], "v": hsv[2]})
 pal_df = pd.DataFrame(pal_rows)
 
-# ---------------------------
-# Master palette across the board
-# ---------------------------
+# ---------- Master palette ----------
 st.subheader("Master Color Palette")
-all_rgb = pal_df[["r", "g", "b"]].to_numpy()
+all_rgb = pal_df[["r","g","b"]].to_numpy()
 master = KMeans(n_clusters=master_palette_k, n_init="auto", random_state=42).fit(all_rgb)
-centers = master.cluster_centers_.astype(float)
-master_hex = [hex_from_rgb(c) for c in centers]
+centers = master.cluster_centers_.astype(float); master_hex = [hex_from_rgb(c) for c in centers]
 pal_df["cluster"] = master.predict(all_rgb)
 cluster_counts = pal_df["cluster"].value_counts().sort_index()
 
-# Swatches
+# swatches
 cols = st.columns(min(6, master_palette_k))
 for i, hx in enumerate(master_hex):
     with cols[i % len(cols)]:
@@ -441,88 +457,38 @@ for i, hx in enumerate(master_hex):
             unsafe_allow_html=True,
         )
 
-# Bar chart of cluster shares (colored by actual hex)
-share_df = pd.DataFrame({
-    "cluster": [f"C{i+1}" for i in range(master_palette_k)],
-    "count": [int(cluster_counts.get(i, 0)) for i in range(master_palette_k)],
-    "hex": master_hex,
-})
-bar = (
-    alt.Chart(share_df)
-    .mark_bar(stroke="black", strokeWidth=0.25)
-    .encode(
-        x=alt.X("cluster:N", sort=None, title="Cluster"),
-        y=alt.Y("count:Q", title="Frequency"),
-        color=alt.Color("hex:N", scale=None, legend=None),
-        tooltip=["cluster", "hex", "count"],
-    )
-    .properties(height=240)
-)
+# share bars (colored)
+share_df = pd.DataFrame({"cluster":[f"C{i+1}" for i in range(master_palette_k)],
+                         "count":[int(cluster_counts.get(i,0)) for i in range(master_palette_k)],
+                         "hex":master_hex})
+bar = alt.Chart(share_df).mark_bar(stroke="black", strokeWidth=0.25).encode(
+    x=alt.X("cluster:N", sort=None, title="Cluster"),
+    y=alt.Y("count:Q", title="Frequency"),
+    color=alt.Color("hex:N", scale=None, legend=None),
+    tooltip=["cluster","hex","count"],
+).properties(height=240)
 st.altair_chart(bar, use_container_width=True)
 
-# ---------------------------
-# Pin Gallery (CSS grid + hover overlay) — show ALL analyzed pins
-# ---------------------------
+# ---------- Pin Gallery (CSS grid + hover overlay; ALL pins) ----------
 st.subheader("Pin Gallery")
 st.caption(f"Showing {len(colors_df)} of {len(pins_df)} pins (image fetch failures: {fetch_failures})")
 
-# CSS for grid + overlay
 st.markdown(f"""
 <style>
 .pin-grid {{
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax({thumb_size}px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax({st.session_state.get('thumb_size', 120) if 'thumb_size' in st.session_state else 120}px, 1fr));
   gap: 8px;
 }}
-.pin-card {{
-  position: relative;
-  aspect-ratio: 1/1;
-  overflow: hidden;
-  border-radius: 8px;
-  border: 1px solid #ddd;
-  background: #f7f7f7;
-}}
-.pin-card img {{
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}}
-.pin-overlay {{
-  position: absolute;
-  left: 0; right: 0; bottom: 0;
-  background: rgba(255,255,255,0.96);
-  transform: translateY(100%);
-  transition: transform 160ms ease;
-  padding: 6px 8px;
-  border-top: 1px solid #eee;
-}}
+.pin-card {{ position: relative; aspect-ratio: 1/1; overflow: hidden; border-radius: 8px; border: 1px solid #ddd; background: #f7f7f7; }}
+.pin-card img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+.pin-overlay {{ position: absolute; left:0; right:0; bottom:0; background: rgba(255,255,255,0.96); transform: translateY(100%);
+  transition: transform 160ms ease; padding: 6px 8px; border-top: 1px solid #eee; }}
 .pin-card:hover .pin-overlay {{ transform: translateY(0%); }}
-.palette-row {{
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 4px;
-  margin-top: 4px;
-}}
-.swatch {{
-  height: 12px;
-  border-radius: 4px;
-  border: 1px solid rgba(0,0,0,0.1);
-}}
-.hexline {{
-  margin-top: 4px;
-  font-size: 11px;
-  color: #333;
-  line-height: 1.2;
-  word-break: break-all;
-}}
-.title {{
-  font-size: 12px;
-  color: #222;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}}
+.palette-row {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin-top: 4px; }}
+.swatch {{ height: 12px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.1); }}
+.hexline {{ margin-top: 4px; font-size: 11px; color: #333; line-height: 1.2; word-break: break-all; }}
+.title {{ font-size: 12px; color: #222; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -541,59 +507,38 @@ for _, r in colors_df.iterrows():
     <div class='palette-row'>{swatches}</div>
     <div class='hexline'>{hexline}</div>
   </div>
-</div>
-""")
-grid_html = f"<div class='pin-grid'>{''.join(cards)}</div>" if len(cards) else "<div class='pin-grid'></div>"
-st.markdown(grid_html, unsafe_allow_html=True)
+</div>""")
+st.markdown(f"<div class='pin-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
-# ---------------------------
-# Hue histogram
-# ---------------------------
+# ---------- Hue histogram ----------
 st.subheader("Hue Distribution")
 pal_df["h_deg"] = (pal_df["h"] * 360.0).round(1)
-bins = np.arange(0, 361, 10)
-labels = (bins[:-1] + bins[1:]) / 2
+bins = np.arange(0, 361, 10); labels = (bins[:-1] + bins[1:]) / 2
 pal_df["h_bin"] = pd.cut(pal_df["h_deg"], bins=bins, include_lowest=True, labels=labels)
 h_bin_df = pal_df.groupby("h_bin").size().reset_index(name="count")
 h_bin_df["h_mid"] = h_bin_df["h_bin"].astype(float)
 h_bin_df["h_color"] = h_bin_df["h_mid"].apply(lambda d: f"hsl({int(d)}, 90%, 50%)")
-hue_hist = (
-    alt.Chart(h_bin_df)
-    .mark_bar(stroke="black", strokeWidth=0.25)
-    .encode(
-        x=alt.X("h_mid:Q", title="Hue (°)"),
-        y=alt.Y("count:Q", title="Count"),
-        color=alt.Color("h_color:N", scale=None, legend=None),
-        tooltip=["h_mid", "count"],
-    ).properties(height=240)
-)
+hue_hist = alt.Chart(h_bin_df).mark_bar(stroke="black", strokeWidth=0.25).encode(
+    x=alt.X("h_mid:Q", title="Hue (°)"), y=alt.Y("count:Q", title="Count"),
+    color=alt.Color("h_color:N", scale=None, legend=None),
+    tooltip=["h_mid","count"],
+).properties(height=240)
 st.altair_chart(hue_hist, use_container_width=True)
 
-# ---------------------------
-# Hue × Value Radial Map (Smoothed)
-# ---------------------------
+# ---------- Hue × Value Radial Map (Smoothed) ----------
 st.subheader("Hue × Value Radial Map (Smoothed)")
-
-hv_h_deg = (pal_df["h"].to_numpy() * 360.0).astype(float)
+hv_h_deg = (pal_df["h"].to_numpy()*360.0).astype(float)
 hv_v = pal_df["v"].to_numpy().astype(float)
 rgb_arr = pal_df[["r","g","b"]].to_numpy().astype(float)
+H_STEPS, V_STEPS, SIGMA_H, SIGMA_V, OUTER_R, INNER_PAD = 72, 24, 18.0, 0.12, 140, 24
 
-H_STEPS = 72   # 5° bins
-V_STEPS = 24   # radial bins
-SIGMA_H = 18.0 # degrees
-SIGMA_V = 0.12 # 0..1
-OUTER_R = 140  # px
-INNER_PAD = 24 # px
-
-def smooth_color(h_center_deg, v_center):
-    dh = np.abs(h_center_deg - hv_h_deg)
-    dh = np.minimum(dh, 360.0 - dh)
-    dv = np.abs(v_center - hv_v)
+def smooth_color(hc, vc):
+    dh = np.abs(hc - hv_h_deg); dh = np.minimum(dh, 360.0 - dh)
+    dv = np.abs(vc - hv_v)
     w = np.exp(-(dh**2)/(2*SIGMA_H**2) - (dv**2)/(2*SIGMA_V**2))
-    ws = w.sum()
-    if ws <= 1e-9:
-        return None
-    rgb = (rgb_arr * w[:, None]).sum(axis=0) / ws
+    ws = w.sum(); 
+    if ws <= 1e-9: return None
+    rgb = (rgb_arr * w[:,None]).sum(axis=0) / ws
     return hex_from_rgb(rgb)
 
 theta_span = 360.0 / H_STEPS
@@ -607,43 +552,27 @@ for v_c, v_lo, v_hi in zip(v_centers, v_edges[:-1], v_edges[1:]):
     outer = INNER_PAD + v_hi * OUTER_R
     for h_c in h_centers:
         hx = smooth_color(h_c, v_c)
-        if not hx:
-            continue
-        radial_rows.append({
-            "theta": h_c - theta_span/2,
-            "theta2": h_c + theta_span/2,
-            "radius": inner,
-            "radius2": outer,
-            "hex": hx,
-            "h_center": h_c,
-            "v_center": round(float(v_c), 3),
-        })
-
+        if not hx: continue
+        radial_rows.append({"theta": h_c - theta_span/2, "theta2": h_c + theta_span/2,
+                            "radius": inner, "radius2": outer, "hex": hx,
+                            "h_center": h_c, "v_center": float(v_c)})
 radial_df = pd.DataFrame(radial_rows)
-radial_chart = (
-    alt.Chart(radial_df)
-    .mark_arc(stroke=None)
-    .encode(
-        theta="theta:Q",
-        theta2="theta2:Q",
-        radius="radius:Q",
-        radius2="radius2:Q",
-        color=alt.Color("hex:N", scale=None, legend=None),
-        tooltip=["h_center","v_center"]
-    )
-    .properties(width=380, height=380)
-)
+radial_chart = alt.Chart(radial_df).mark_arc(stroke=None).encode(
+    theta="theta:Q", theta2="theta2:Q",
+    radius="radius:Q", radius2="radius2:Q",
+    color=alt.Color("hex:N", scale=None, legend=None),
+    tooltip=["h_center","v_center"],
+).properties(width=380, height=380)
 st.altair_chart(radial_chart, use_container_width=False)
 
-# ---------------------------
-# Diagnostics
-# ---------------------------
+# ---------- Diagnostics ----------
 with st.expander("🔧 Diagnostics"):
     st.write({
         "board_url": board_url,
-        "pins_parsed": int(len(pins_df)),
+        "pins_parsed_html": int(len(pins_df)),
         "pins_processed": int(len(colors_df)),
         "image_fetch_failures": int(fetch_failures),
-        "method": source,
-        "pages_tried": pages_tried,
+        "source": source,                 # 'json', 'json+api', 'rss'
+        "html_pages": 1,                  # base HTML only
+        "api_pages": api_pages,           # how many API pages were fetched
     })
