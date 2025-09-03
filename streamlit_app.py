@@ -188,7 +188,7 @@ def top_tokens_series(texts, top_k=25, min_df=1):
 
 st.set_page_config(page_title='Pinterest Color & Trend Analyzer', layout='wide')
 st.title('🎯 Pinterest Board — Color & Trend Analyzer')
-st.caption('Paste a **public** Pinterest board URL and click Analyze.')
+st.caption('Paste a **public** Pinterest board URL and click Analyze. UI kept minimal; focus on insights.')
 
 board_url = st.text_input('Pinterest board URL', placeholder='https://www.pinterest.com/<username>/<board-slug>/')
 
@@ -350,59 +350,113 @@ st.altair_chart(sv_scatter, use_container_width=True)
 # Keyword signals (from titles/descriptions if available)
 # ---------------------------
 
-st.subheader('Keyword Signals')
-texts = (colors_df['title'].fillna('') + ' ' + colors_df['description'].fillna('')).tolist()
-kw_series = top_tokens_series(texts, top_k=25, min_df=1)
-if not kw_series.empty:
-    kw_df = kw_series.reset_index()
-    kw_df.columns = ['token','count']
-    kw_chart = alt.Chart(kw_df).mark_bar().encode(
-        x=alt.X('count:Q', title='Count'),
-        y=alt.Y('token:N', sort='-x', title='Token'),
-        tooltip=['token','count']
-    ).properties(height=380)
-    st.altair_chart(kw_chart, use_container_width=True)
+# ---------------------------
+# Color Share (Waffle)
+# ---------------------------
+st.subheader('Color Share (Waffle)')
+# map cluster -> hex for later charts
+cluster_hex_map = {i: master_hex[i] for i in range(len(master_hex))}
+pal_df['cluster_hex'] = pal_df['cluster'].map(cluster_hex_map)
+
+total = int(share_df['count'].sum())
+if total > 0:
+    N = 100
+    raw = (share_df['count'] / total * N).round().astype(int)
+    diff = N - int(raw.sum())
+    if diff != 0:
+        adjust_idx = int(np.argmax(share_df['count'])) if diff > 0 else int(np.argmin(share_df['count']))
+        raw.iloc[adjust_idx] = raw.iloc[adjust_idx] + diff
+    tiles = []
+    cols_n = 10
+    rows_n = int(math.ceil(N / cols_n))
+    k = 0
+    for cluster, n_tiles, hexv in zip(share_df['cluster'], raw, share_df['hex']):
+        for _ in range(int(n_tiles)):
+            r = k // cols_n
+            c = k % cols_n
+            tiles.append({'row': rows_n - 1 - r, 'col': c, 'cluster': cluster, 'hex': hexv})
+            k += 1
+    waffle_df = pd.DataFrame(tiles)
+    waffle = alt.Chart(waffle_df).mark_rect(stroke='white', strokeWidth=0.5).encode(
+        x=alt.X('col:O', axis=None),
+        y=alt.Y('row:O', sort='descending', axis=None),
+        color=alt.Color('hex:N', scale=None, legend=None),
+        tooltip=['cluster','hex']
+    ).properties(height=220)
+    st.altair_chart(waffle, use_container_width=True)
 else:
-    st.info('No meaningful keywords found (board HTML may not include titles/descriptions).')
+    st.info('Not enough color data to render waffle.')
 
 # ---------------------------
-# Data & exports
+# Per-Cluster Distributions
 # ---------------------------
+st.subheader('Per-Cluster Brightness (V) Distribution')
+v_box = alt.Chart(pal_df).mark_boxplot().encode(
+    x=alt.X('cluster:N', title='Cluster'),
+    y=alt.Y('v:Q', title='Brightness (V)'),
+    color=alt.Color('cluster_hex:N', scale=None, legend=None)
+).properties(height=280)
+st.altair_chart(v_box, use_container_width=True)
 
-st.subheader('Data & Exports')
-flat_rows = []
-for _, r in colors_df.iterrows():
-    row = {
-        'pin_id': r['pin_id'], 'title': r['title'], 'description': r['description'], 'created_at': r['created_at'], 'image_url': r['image_url']
-    }
-    for i, hx in enumerate(r['palette_hex'][:8]):
-        row[f'color_{i+1}_hex'] = hx
-    flat_rows.append(row)
-flat_df = pd.DataFrame(flat_rows)
+st.subheader('Per-Cluster Saturation (S) Distribution')
+s_box = alt.Chart(pal_df).mark_boxplot().encode(
+    x=alt.X('cluster:N', title='Cluster'),
+    y=alt.Y('s:Q', title='Saturation (S)'),
+    color=alt.Color('cluster_hex:N', scale=None, legend=None)
+).properties(height=280)
+st.altair_chart(s_box, use_container_width=True)
 
-st.dataframe(flat_df, use_container_width=True)
+# ---------------------------
+# Hue × Value Heatmap (Average Color)
+# ---------------------------
+st.subheader('Hue × Value Heatmap (Average Color)')
+h_bins = np.arange(0, 361, 15)
+v_bins = np.linspace(0, 1, 11)
+pal_df['h_bin'] = pd.cut((pal_df['h']*360.0), bins=h_bins, include_lowest=True, labels=((h_bins[:-1]+h_bins[1:])/2))
+pal_df['v_bin'] = pd.cut(pal_df['v'], bins=v_bins, include_lowest=True, labels=((v_bins[:-1]+v_bins[1:])/2))
+hv = pal_df.groupby(['h_bin','v_bin']).agg(
+    count=('hex','size'),
+    r_mean=('r','mean'),
+    g_mean=('g','mean'),
+    b_mean=('b','mean')
+).reset_index()
+hv = hv.dropna()
+hv['hex'] = hv.apply(lambda r: hex_from_rgb((r['r_mean'], r['g_mean'], r['b_mean'])), axis=1)
+hv['h_mid'] = hv['h_bin'].astype(float)
+hv['v_mid'] = hv['v_bin'].astype(float)
 
-csv = flat_df.to_csv(index=False).encode('utf-8')
-st.download_button('Download analyzed data (CSV)', data=csv, file_name='pinterest_color_trends.csv', mime='text/csv')
+heat = alt.Chart(hv).mark_rect(stroke='black', strokeWidth=0.1).encode(
+    x=alt.X('h_mid:Q', title='Hue (°)'),
+    y=alt.Y('v_mid:Q', title='Value (Brightness)'),
+    color=alt.Color('hex:N', scale=None, legend=None),
+    tooltip=['h_mid','v_mid','count']
+).properties(height=320)
+st.altair_chart(heat, use_container_width=True)
 
-# Master palette PNG
-sw, sh, cols_n = 220, 60, 2
-rows = math.ceil(len(master_hex) / cols_n)
-img = Image.new('RGB', (sw*cols_n, sh*rows), (255,255,255))
-draw_idx = 0
-for r in range(rows):
-    for c in range(cols_n):
-        if draw_idx >= len(master_hex):
-            break
-        hx = master_hex[draw_idx]
-        rgb = tuple(int(hx[i:i+2], 16) for i in (1,3,5))
-        block = Image.new('RGB', (sw, sh), rgb)
-        img.paste(block, (c*sw, r*sh))
-        draw_idx += 1
-buf = io.BytesIO()
-img.save(buf, format='PNG')
-palette_png = buf.getvalue()
-st.download_button('Download master palette (PNG)', data=palette_png, file_name='board_master_palette.png', mime='image/png')
+# ---------------------------
+# Dominant Color Sequence (by pin order)
+# ---------------------------
+st.subheader('Dominant Color Sequence')
+colors_df['order'] = np.arange(len(colors_df))
+
+def _dom_h_deg(pal):
+    try:
+        return float(pal[0][0]) * 360.0
+    except Exception:
+        return np.nan
+colors_df['dom_h_deg'] = colors_df['palette_hsv'].apply(_dom_h_deg)
+
+line = alt.Chart(colors_df).mark_line(color='#888').encode(
+    x=alt.X('order:Q', title='Pin order (scrape)'),
+    y=alt.Y('dom_h_deg:Q', title='Dominant Hue (°)')
+)
+pts = alt.Chart(colors_df).mark_point(size=60).encode(
+    x='order:Q',
+    y='dom_h_deg:Q',
+    color=alt.Color('dominant_hex:N', scale=None, legend=None),
+    tooltip=['title','dominant_hex','order','dom_h_deg']
+)
+st.altair_chart(line + pts, use_container_width=True)
 
 # ---------------------------
 # Notes
