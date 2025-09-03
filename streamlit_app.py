@@ -5,9 +5,8 @@
 # - Paste a PUBLIC Pinterest board URL and click Analyze.
 # - Only analyzes pins that BELONG to that board (excludes "More like this").
 # - If Pinterest's embedded JSON isn't accessible, falls back to board RSS.
-# - Color-true charts (bars/dots use real hex).
-# - Visuals: Master palette, Pin Gallery (CSS grid + hover overlay), HSV insights,
-#            Color Waffle, Per-cluster boxplots, Hue×Value heatmap, Dominant Color Sequence.
+# - Color-true visuals: Master palette, Pin Gallery (CSS grid + hover overlay),
+#   Hue histogram, Hue×Value Radial Map (smoothed).
 # - Diagnostics expander shows which method (JSON/RSS) was used.
 # -------------------------------------------------------------
 
@@ -395,26 +394,10 @@ bar = (
 st.altair_chart(bar, use_container_width=True)
 
 # ---------------------------
-# Pin Gallery (CSS grid with hover overlay)
+# Pin Gallery (CSS grid with hover overlay) — show ALL pins
 # ---------------------------
 st.subheader("Pin Gallery")
-
-# Assign each pin to the nearest master cluster based on its dominant color
-pin_clusters = []
-dom_rgbs = colors_df["palette_rgb"].apply(lambda lst: lst[0] if (isinstance(lst, list) and len(lst) > 0) else [0, 0, 0])
-for rgb in dom_rgbs:
-    try:
-        pin_clusters.append(int(master.predict([rgb])[0]))
-    except Exception:
-        pin_clusters.append(None)
-colors_df["pin_cluster"] = pin_clusters
-
-cluster_options = [f"C{i+1}" for i in range(master_palette_k)]
-sel_clusters = st.multiselect("Filter by cluster", cluster_options, default=cluster_options)
-sel_idx = [int(c[1:]) - 1 for c in sel_clusters]
-
-gallery_df = colors_df[colors_df["pin_cluster"].isin(sel_idx)].copy()
-st.caption(f"Showing {len(gallery_df)} of {len(colors_df)} pins")
+st.caption(f"Showing {len(colors_df)} of {len(colors_df)} pins")
 
 # CSS for grid + overlay
 st.markdown(f"""
@@ -476,9 +459,9 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# Build cards
+# Build cards for ALL pins in colors_df
 cards = []
-for _, r in gallery_df.iterrows():
+for _, r in colors_df.iterrows():
     t = html.escape((r.get("title") or "").strip())
     palette = r.get("palette_hex") or []
     swatches = "".join([f"<div class='swatch' style='background:{html.escape(hx)}'></div>" for hx in palette[:5]])
@@ -498,9 +481,9 @@ grid_html = f"<div class='pin-grid'>{''.join(cards)}</div>" if len(cards) else "
 st.markdown(grid_html, unsafe_allow_html=True)
 
 # ---------------------------
-# HSV insights — color-true
+# Hue histogram
 # ---------------------------
-st.subheader("Hue / Saturation / Value Insights")
+st.subheader("Hue Distribution")
 pal_df["h_deg"] = (pal_df["h"] * 360.0).round(1)
 bins = np.arange(0, 361, 10)
 labels = (bins[:-1] + bins[1:]) / 2
@@ -520,125 +503,76 @@ hue_hist = (
 )
 st.altair_chart(hue_hist, use_container_width=True)
 
-sv_scatter = (
-    alt.Chart(pal_df)
-    .mark_circle(size=60, stroke="black", strokeWidth=0.15)
-    .encode(
-        x=alt.X("s:Q", title="Saturation"),
-        y=alt.Y("v:Q", title="Value (Brightness)"),
-        color=alt.Color("hex:N", scale=None, legend=None),
-        tooltip=["hex", "title"],
-    ).properties(height=300)
-)
-st.altair_chart(sv_scatter, use_container_width=True)
+# ---------------------------
+# Hue × Value Radial Map (Smoothed)
+# ---------------------------
+st.subheader("Hue × Value Radial Map (Smoothed)")
 
-# ---------------------------
-# Color Share (Waffle)
-# ---------------------------
-st.subheader("Color Share (Waffle)")
-total = int(share_df["count"].sum())
-if total > 0:
-    N = 100
-    raw = (share_df["count"] / total * N).round().astype(int)
-    diff = N - int(raw.sum())
-    if diff != 0:
-        adjust_idx = int(np.argmax(share_df["count"])) if diff > 0 else int(np.argmin(share_df["count"]))
-        raw.iloc[adjust_idx] = raw.iloc[adjust_idx] + diff
-    tiles = []; cols_n = 10; rows_n = int(math.ceil(N / cols_n)); k = 0
-    for cluster, n_tiles, hexv in zip(share_df["cluster"], raw, share_df["hex"]):
-        for _ in range(int(n_tiles)):
-            r = k // cols_n; c = k % cols_n
-            tiles.append({"row": rows_n - 1 - r, "col": c, "cluster": cluster, "hex": hexv}); k += 1
-    waffle_df = pd.DataFrame(tiles)
-    waffle = (
-        alt.Chart(waffle_df)
-        .mark_rect(stroke="white", strokeWidth=0.5)
-        .encode(
-            x=alt.X("col:O", axis=None),
-            y=alt.Y("row:O", sort="descending", axis=None),
-            color=alt.Color("hex:N", scale=None, legend=None),
-            tooltip=["cluster", "hex"],
-        ).properties(height=220)
+# Prepare arrays for smoothing
+hv_h_deg = (pal_df["h"].to_numpy() * 360.0).astype(float)
+hv_v = pal_df["v"].to_numpy().astype(float)
+rgb_arr = pal_df[["r","g","b"]].to_numpy().astype(float)
+
+# Parameters for detail & smoothing
+H_STEPS = 72   # bins around the circle (every 5°)
+V_STEPS = 24   # radial bins from center (value 0) to edge (value 1)
+SIGMA_H = 18.0 # degrees
+SIGMA_V = 0.12 # in [0..1]
+OUTER_R = 140  # px radius for the plot
+INNER_PAD = 24 # inner hole pad (px)
+
+def smooth_color(h_center_deg, v_center):
+    # circular hue distance in degrees
+    dh = np.abs(h_center_deg - hv_h_deg)
+    dh = np.minimum(dh, 360.0 - dh)
+    dv = np.abs(v_center - hv_v)
+    w = np.exp(-(dh**2)/(2*SIGMA_H**2) - (dv**2)/(2*SIGMA_V**2))
+    ws = w.sum()
+    if ws <= 1e-9:
+        return None
+    rgb = (rgb_arr * w[:, None]).sum(axis=0) / ws
+    return hex_from_rgb(rgb)
+
+# Build dense polar grid of small arc segments
+theta_span = 360.0 / H_STEPS
+v_edges = np.linspace(0.0, 1.0, V_STEPS+1)
+v_centers = (v_edges[:-1] + v_edges[1:]) / 2
+h_centers = np.linspace(0.0, 360.0 - theta_span, H_STEPS)
+
+radial_rows = []
+for v_c, v_lo, v_hi in zip(v_centers, v_edges[:-1], v_edges[1:]):
+    inner = INNER_PAD + v_lo * OUTER_R
+    outer = INNER_PAD + v_hi * OUTER_R
+    for h_c in h_centers:
+        hx = smooth_color(h_c, v_c)
+        if not hx:
+            continue
+        radial_rows.append({
+            "theta": h_c - theta_span/2,
+            "theta2": h_c + theta_span/2,
+            "radius": inner,
+            "radius2": outer,
+            "hex": hx,
+            "h_center": h_c,
+            "v_center": round(float(v_c), 3),
+        })
+
+radial_df = pd.DataFrame(radial_rows)
+
+radial_chart = (
+    alt.Chart(radial_df)
+    .mark_arc(stroke=None)
+    .encode(
+        theta="theta:Q",
+        theta2="theta2:Q",
+        radius="radius:Q",
+        radius2="radius2:Q",
+        color=alt.Color("hex:N", scale=None, legend=None),
+        tooltip=["h_center","v_center"]
     )
-    st.altair_chart(waffle, use_container_width=True)
-else:
-    st.info("Not enough color data to render waffle.")
-
-# ---------------------------
-# Per-Cluster Distributions
-# ---------------------------
-cluster_hex_map = {i: master_hex[i] for i in range(len(master_hex))}
-pal_df["cluster_hex"] = pal_df["cluster"].map(cluster_hex_map)
-
-st.subheader("Per-Cluster Brightness (V) Distribution")
-v_box = (
-    alt.Chart(pal_df)
-    .mark_boxplot()
-    .encode(
-        x=alt.X("cluster:N", title="Cluster"),
-        y=alt.Y("v:Q", title="Brightness (V)"),
-        color=alt.Color("cluster_hex:N", scale=None, legend=None),
-    ).properties(height=280)
+    .properties(width=380, height=380)
 )
-st.altair_chart(v_box, use_container_width=True)
-
-st.subheader("Per-Cluster Saturation (S) Distribution")
-s_box = (
-    alt.Chart(pal_df)
-    .mark_boxplot()
-    .encode(
-        x=alt.X("cluster:N", title="Cluster"),
-        y=alt.Y("s:Q", title="Saturation (S)"),
-        color=alt.Color("cluster_hex:N", scale=None, legend=None),
-    ).properties(height=280)
-)
-st.altair_chart(s_box, use_container_width=True)
-
-# ---------------------------
-# Hue × Value Heatmap (Average Color)
-# ---------------------------
-st.subheader("Hue × Value Heatmap (Average Color)")
-h_bins = np.arange(0, 361, 15); v_bins = np.linspace(0, 1, 11)
-pal_df["h_bin2"] = pd.cut((pal_df["h"] * 360.0), bins=h_bins, include_lowest=True, labels=((h_bins[:-1] + h_bins[1:]) / 2))
-pal_df["v_bin2"] = pd.cut(pal_df["v"], bins=v_bins, include_lowest=True, labels=((v_bins[:-1] + v_bins[1:]) / 2))
-hv = (
-    pal_df.groupby(["h_bin2", "v_bin2"])
-    .agg(count=("hex", "size"), r_mean=("r", "mean"), g_mean=("g", "mean"), b_mean=("b", "mean"))
-    .reset_index().dropna()
-)
-hv["hex"] = hv.apply(lambda r: hex_from_rgb((r["r_mean"], r["g_mean"], r["b_mean"])), axis=1)
-hv["h_mid"] = hv["h_bin2"].astype(float); hv["v_mid"] = hv["v_bin2"].astype(float)
-heat = (
-    alt.Chart(hv)
-    .mark_rect(stroke="black", strokeWidth=0.1)
-    .encode(
-        x=alt.X("h_mid:Q", title="Hue (°)"),
-        y=alt.Y("v_mid:Q", title="Value (Brightness)"),
-        color=alt.Color("hex:N", scale=None, legend=None),
-        tooltip=["h_mid", "v_mid", "count"],
-    ).properties(height=320)
-)
-st.altair_chart(heat, use_container_width=True)
-
-# ---------------------------
-# Dominant Color Sequence (by pin order)
-# ---------------------------
-st.subheader("Dominant Color Sequence")
-colors_df["order"] = np.arange(len(colors_df))
-def _dom_h_deg(pal): 
-    try: return float(pal[0][0]) * 360.0
-    except Exception: return np.nan
-colors_df["dom_h_deg"] = colors_df["palette_hsv"].apply(_dom_h_deg)
-seq_line = alt.Chart(colors_df).mark_line(color="#888").encode(
-    x=alt.X("order:Q", title="Pin order (scrape)"),
-    y=alt.Y("dom_h_deg:Q", title="Dominant Hue (°)"),
-)
-seq_pts = alt.Chart(colors_df).mark_point(size=60).encode(
-    x="order:Q", y="dom_h_deg:Q",
-    color=alt.Color("dominant_hex:N", scale=None, legend=None),
-    tooltip=["title", "dominant_hex", "order", "dom_h_deg"],
-)
-st.altair_chart(seq_line + seq_pts, use_container_width=True)
+st.altair_chart(radial_chart, use_container_width=False)
 
 # ---------------------------
 # Diagnostics
