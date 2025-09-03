@@ -188,7 +188,7 @@ def top_tokens_series(texts, top_k=25, min_df=1):
 
 st.set_page_config(page_title='Pinterest Color & Trend Analyzer', layout='wide')
 st.title('🎯 Pinterest Board — Color & Trend Analyzer')
-st.caption('Paste a **public** Pinterest board URL and click Analyze. UI kept minimal; focus on insights.')
+st.caption('Paste a **public** Pinterest board URL and click Analyze.')
 
 board_url = st.text_input('Pinterest board URL', placeholder='https://www.pinterest.com/<username>/<board-slug>/')
 
@@ -306,9 +306,10 @@ share_df = pd.DataFrame({
     'count': [int(cluster_counts.get(i,0)) for i in range(master_palette_k)],
     'hex': master_hex,
 })
-bar = alt.Chart(share_df).mark_bar().encode(
+bar = alt.Chart(share_df).mark_bar(stroke='black', strokeWidth=0.25).encode(
     x=alt.X('cluster:N', sort=None, title='Cluster'),
     y=alt.Y('count:Q', title='Frequency'),
+    color=alt.Color('hex:N', scale=None, legend=None),
     tooltip=['cluster','hex','count']
 ).properties(height=240)
 st.altair_chart(bar, use_container_width=True)
@@ -320,16 +321,27 @@ st.altair_chart(bar, use_container_width=True)
 st.subheader('Hue / Saturation / Value Insights')
 pal_df['h_deg'] = (pal_df['h'] * 360.0).round(1)
 
-hue_hist = alt.Chart(pal_df).mark_bar().encode(
-    x=alt.X('h_deg:Q', bin=alt.Bin(maxbins=36), title='Hue (°)'),
-    y=alt.Y('count():Q', title='Count'),
-    tooltip=['count()']
+# Pre-bin hue so we can paint bars with actual hue colors
+pal_df['h_deg'] = (pal_df['h'] * 360.0).round(1)
+bins = np.arange(0, 361, 10)
+labels = (bins[:-1] + bins[1:]) / 2
+pal_df['h_bin'] = pd.cut(pal_df['h_deg'], bins=bins, include_lowest=True, labels=labels)
+h_bin_df = pal_df.groupby('h_bin').size().reset_index(name='count')
+h_bin_df['h_mid'] = h_bin_df['h_bin'].astype(float)
+h_bin_df['h_color'] = h_bin_df['h_mid'].apply(lambda d: f'hsl({int(d)}, 90%, 50%)')
+
+hue_hist = alt.Chart(h_bin_df).mark_bar(stroke='black', strokeWidth=0.25).encode(
+    x=alt.X('h_mid:Q', title='Hue (°)'),
+    y=alt.Y('count:Q', title='Count'),
+    color=alt.Color('h_color:N', scale=None, legend=None),
+    tooltip=['h_mid','count']
 ).properties(height=240)
 st.altair_chart(hue_hist, use_container_width=True)
 
-sv_scatter = alt.Chart(pal_df).mark_circle(size=60).encode(
+sv_scatter = alt.Chart(pal_df).mark_circle(size=60, stroke='black', strokeWidth=0.15).encode(
     x=alt.X('s:Q', title='Saturation'),
     y=alt.Y('v:Q', title='Value (Brightness)'),
+    color=alt.Color('hex:N', scale=None, legend=None),
     tooltip=['hex','title']
 ).properties(height=300)
 st.altair_chart(sv_scatter, use_container_width=True)
