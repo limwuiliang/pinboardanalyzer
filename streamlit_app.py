@@ -37,22 +37,45 @@ def rgb_to_hsv_np(rgb):
     v = mx
     return np.stack([h,s,v], axis=-1)
 
-# ---- NEW: foreground pixels helper (ignores white/grey backdrops) ----
-def foreground_pixels_from_array(arr: np.ndarray, min_keep: int = 1200) -> np.ndarray:
+# ---------- NEW: foreground pixels helper with alpha + sensitivity ----------
+def foreground_pixels_from_array(
+    arr: np.ndarray,
+    alpha_mask: np.ndarray | None = None,   # float 0..1 or uint8 0..255
+    sensitivity: float = 1.0,               # higher => remove more background
+    alpha_cut: float | None = None,         # 0..1; pixels <= cut are treated as background if alpha present
+    min_keep: int = 1200
+) -> np.ndarray:
     """
     Estimate background from image borders (HSV space, KMeans on border),
     then keep pixels far from that background OR sufficiently saturated.
+    Also honors a provided alpha mask (drop low alpha).
     Falls back to full image if too few foreground pixels remain.
     """
     h, w, _ = arr.shape
-    bw = max(4, int(min(h, w) * 0.05))  # ~5% border
-    # Gather border pixels
+    bw = max(4, int(min(h, w) * 0.05))  # ~5% border for estimation
+
+    # Build border stacks
     top = arr[:bw, :, :]
     bottom = arr[-bw:, :, :]
     left = arr[:, :bw, :]
     right = arr[:, -bw:, :]
     border = np.concatenate([top.reshape(-1,3), bottom.reshape(-1,3),
                              left.reshape(-1,3), right.reshape(-1,3)], axis=0)
+
+    # Optional alpha for border (drop transparent border pixels)
+    if alpha_mask is not None and alpha_cut is not None:
+        atop = alpha_mask[:bw, :]
+        abot = alpha_mask[-bw:, :]
+        aleft = alpha_mask[:, :bw]
+        aright = alpha_mask[:, -bw:]
+        aborder = np.concatenate([atop.reshape(-1), abot.reshape(-1),
+                                  aleft.reshape(-1), aright.reshape(-1)], axis=0)
+        if aborder.max() > 1.0:  # uint8 -> normalize
+            aborder = aborder.astype(np.float32) / 255.0
+        keep_border = aborder > alpha_cut
+        if keep_border.any():
+            border = border[keep_border]
+
     # Downsample border for speed
     if border.shape[0] > 5000:
         sel = np.random.RandomState(42).choice(border.shape[0], 5000, replace=False)
@@ -66,28 +89,37 @@ def foreground_pixels_from_array(arr: np.ndarray, min_keep: int = 1200) -> np.nd
     bg_cluster = int(np.argmax(counts))
     bg_center = km.cluster_centers_[bg_cluster]  # (h,s,v) in [0..1]
 
-    # Distance of border pixels to bg center to set a robust threshold
+    # Distance distribution on border -> adaptive threshold
     d_border = np.linalg.norm(border_hsv - bg_center[None, :], axis=1)
-    thr = max(np.median(d_border) * 1.6, 0.08)  # adaptive + floor
+    base_thr = max(np.median(d_border) * 1.6, 0.08)
+    thr = base_thr * float(max(0.25, sensitivity))  # sensitivity scales aggressiveness
 
+    # Flatten full image
     full = arr.reshape(-1,3)
     full_hsv = rgb_to_hsv_np(full)
     d_full = np.linalg.norm(full_hsv - bg_center[None, :], axis=1)
 
-    # Low-sat high-value heuristic for white/grey screens
+    # Heuristic for white/grey studio backdrops
     low_sat_hi_val = (full_hsv[:,1] < 0.12) & (full_hsv[:,2] > 0.92)
 
     keep_mask = (d_full > thr) & (~low_sat_hi_val)
 
-    # If we were too aggressive, relax to a saturation gate
+    # Apply alpha gate (treat low-alpha as background)
+    if alpha_mask is not None and alpha_cut is not None:
+        aflat = alpha_mask.reshape(-1)
+        if aflat.max() > 1.0:  # uint8
+            aflat = aflat.astype(np.float32) / 255.0
+        keep_mask &= (aflat > alpha_cut)
+
+    # If too few remain, relax to a soft saturation gate
     if keep_mask.sum() < min_keep:
         keep_mask = full_hsv[:,1] > 0.08
 
     kept = full[keep_mask]
-    # Absolute fallback if still tiny
     if kept.shape[0] < min_keep:
         kept = full
     return kept
+# ---------------------------------------------------------------------------
 
 def _get_cookie(key: str, cookie: str | None):
     if not cookie: return None
@@ -166,7 +198,11 @@ def fetch_image_bytes(url, cookie=None, timeout=15):
         return None
 
 @st.cache_data(show_spinner=False)
-def load_image_as_array(url, cookie=None, max_side=512):
+def load_image_as_array(url, cookie=None, max_side=512, return_alpha: bool = False):
+    """
+    Return RGB array (and alpha mask if return_alpha=True and the image has transparency).
+    Alpha mask is float 0..1 (or None if not present).
+    """
     candidates = [url]
     if "i.pinimg.com" in url:
         for size in ("736x","474x","236x"):
@@ -177,15 +213,27 @@ def load_image_as_array(url, cookie=None, max_side=512):
         if not data: continue
         try:
             with Image.open(io.BytesIO(data)) as img:
-                img = img.convert("RGB")
+                # Preserve alpha if requested; else keep it simple
+                if return_alpha:
+                    img = img.convert("RGBA")
+                else:
+                    img = img.convert("RGB")
+
                 w, h = img.size
                 scale = max(w,h)/max_side if max(w,h) > max_side else 1
                 if scale > 1:
                     img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
-                return np.array(img)
+
+                if return_alpha and img.mode == "RGBA":
+                    rgba = np.array(img)
+                    rgb = rgba[...,:3]
+                    alpha = rgba[...,3].astype(np.float32) / 255.0
+                    return rgb, alpha
+                else:
+                    return np.array(img), None
         except Exception:
             continue
-    return None
+    return (None, None) if return_alpha else None
 
 # ===============================
 # Scrapers (board-only)
@@ -443,6 +491,15 @@ with st.expander("Settings", expanded=False):
     master_palette_k = st.slider("Master palette size (across board)", 5, 20, 10)
     thumb_size = st.slider("Pin thumbnail size (px)", 90, 200, 120, step=10)
 
+    # ---------- NEW controls ----------
+    bg_sensitivity = st.slider(
+        "Background sensitivity (higher removes more background)",
+        0.5, 2.0, 1.0, 0.05
+    )
+    use_alpha_cut = st.checkbox("Use PNG/WebP transparency to drop background", value=True)
+    alpha_cut = st.slider("Alpha cutoff", 0.0, 1.0, 0.97, 0.01) if use_alpha_cut else None
+    # ----------------------------------
+
 with st.expander("Advanced (optional)", expanded=False):
     st.markdown("**Use a cookie to go beyond the ~50-pin public cap.**")
     st.markdown(
@@ -476,12 +533,25 @@ pins_df = pd.DataFrame(pins[:pin_limit])
 
 progress = st.progress(0); records, fetch_failures = [], 0
 for idx, row in pins_df.iterrows():
-    arr = load_image_as_array(row["image_url"], cookie=cookie)
+    # --- load with optional alpha ---
+    if use_alpha_cut:
+        arr, alpha = load_image_as_array(row["image_url"], cookie=cookie, return_alpha=True)
+    else:
+        arr, alpha = load_image_as_array(row["image_url"], cookie=cookie, return_alpha=False), None
+
+    if isinstance(arr, tuple):  # safety if cache returned (arr, None)
+        arr, _ = arr
+
     if arr is None:
         fetch_failures += 1; continue
 
-    # ---- UPDATED: use foreground-only pixels for palette extraction ----
-    pixels = foreground_pixels_from_array(arr)  # ignores white/grey backdrop
+    # --- foreground-only pixels with controls ---
+    pixels = foreground_pixels_from_array(
+        arr,
+        alpha_mask=alpha,
+        sensitivity=bg_sensitivity,
+        alpha_cut=alpha_cut
+    )
     if pixels.shape[0] > 6000:
         sel = np.random.RandomState(42).choice(pixels.shape[0], 6000, replace=False)
         pixels = pixels[sel]
@@ -500,7 +570,8 @@ for idx, row in pins_df.iterrows():
         "description": row.get("description",""),
         "created_at": row.get("created_at"),
         "palette_hex": hexes, "palette_rgb": centers.tolist(),
-        "palette_hsv": hsv.tolist(), "dominant_hex": hexes[0] if hexes else None,
+        "palette_hsv": hsv.tolist(),
+        "dominant_hex": hexes[0] if hexes else None,
     })
     progress.progress(min(1.0, (len(records)/len(pins_df))))
 progress.empty()
