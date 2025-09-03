@@ -6,15 +6,15 @@
 #  1) HTML JSON (__PWS_DATA__) + board_id
 #  2) BoardFeedResource (if cookie provided)
 #  3) Pidgets (public, no login) pagination  << main workhorse
-#  4) RSS with Atom rel="next" + ?num=100
+#  4) RSS with Atom rel="next" + ?num=100  (now also parses pin_id from <link>)
 #  5) HTML ?page=2..10
 # Visuals: Master Palette (DESC), Pin Gallery (sorted by C1..),
 #          Hue Histogram (colored), Hue × Value Radial Map,
-#          Hue × Value Explorer (brush + tight, responsive thumbnails)
+#          Hue × Value Explorer (brush + tight, responsive thumbnails via data-URIs)
 # Strict board-only: excludes "More like this".
 # -------------------------------------------------------------
 
-import io, re, json, html, math, xml.etree.ElementTree as ET
+import io, re, json, html, math, xml.etree.ElementTree as ET, base64
 from urllib.parse import urlparse, urljoin
 
 import requests, numpy as np, pandas as pd
@@ -93,6 +93,26 @@ def _normalize_board_path(u: str):
         return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else None
     except Exception:
         return None
+
+# Data-URI thumbnail (avoids CORS in Altair mark_image)
+def array_to_data_uri(arr: np.ndarray, max_side: int = 112, fmt: str = "JPEG", quality: int = 80) -> str:
+    try:
+        img = Image.fromarray(arr.astype(np.uint8))
+        w, h = img.size
+        scale = max(w, h) / max_side if max(w, h) > max_side else 1
+        if scale > 1:
+            img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+        bio = io.BytesIO()
+        if fmt.upper() == "PNG":
+            img.save(bio, "PNG", optimize=True)
+            mime = "image/png"
+        else:
+            img.save(bio, "JPEG", quality=quality, optimize=True, subsampling=2)
+            mime = "image/jpeg"
+        b64 = base64.b64encode(bio.getvalue()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return ""
 
 # ===============================
 # Image IO
@@ -232,7 +252,6 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
                     if pid in seen_ids: continue
                     seen_ids.add(pid)  # keep even if URL matches another pin
                 else:
-                    # no id? fall back to URL dedupe
                     canon = canonicalize_pin_url(img_url)
                     if any(canonicalize_pin_url(p["image_url"]) == canon for p in pins):
                         continue
@@ -305,7 +324,7 @@ def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 100, m
 
     return pins, pages
 
-# ---- RSS (paginated)
+# ---- RSS (paginated) — now extracts pin_id from <link>
 def _parse_rss_batch(xml_text: str):
     try:
         root = ET.fromstring(xml_text)
@@ -316,6 +335,9 @@ def _parse_rss_batch(xml_text: str):
     pins = []
     for it in items:
         title_el = it.find("title"); title = title_el.text if title_el is not None else ""
+        link_el = it.find("link"); link_txt = link_el.text if link_el is not None else ""
+        m_id = re.search(r"/pin/(\d+)", link_txt or "")
+        pin_id = m_id.group(1) if m_id else None
         pub_el = it.find("pubDate"); created_at = pub_el.text if pub_el is not None else None
         img_url = None
         mc = it.find("media:content", ns)
@@ -331,7 +353,7 @@ def _parse_rss_batch(xml_text: str):
             m = PINTEREST_IMG_RE.search(desc or ""); 
             if m: img_url = m.group(0)
         if img_url:
-            pins.append({"pin_id": None, "title": title or "", "description": "",
+            pins.append({"pin_id": pin_id, "title": title or "", "description": "",
                          "created_at": created_at, "image_url": img_url})
     next_href = None
     for link in root.findall(".//atom:link", ns):
@@ -414,7 +436,6 @@ def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
                 seen_ids.add(pid)
                 url_to_ids.setdefault(url, set()).add(pid)
             else:
-                # drop anonymous duplicates by URL, but only if an ID pin already has this URL
                 if url in url_to_ids and url_to_ids[url]:
                     continue
                 if url in anon_urls:
@@ -495,7 +516,7 @@ if not pins:
 pins_df = pd.DataFrame(pins)
 
 # ===============================
-# Color extraction
+# Color extraction (+ inline thumbnails for Explorer)
 # ===============================
 
 progress = st.progress(0); records, fetch_failures = [], 0
@@ -511,9 +532,11 @@ for idx, row in pins_df.iterrows():
     centers = km.cluster_centers_.astype(float)
     hsv = rgb_to_hsv_np(centers)
     hexes = [hex_from_rgb(c) for c in centers]
+    thumb_uri = array_to_data_uri(arr, max_side=112, fmt="JPEG", quality=78)
     records.append({
         "pin_id": row.get("pin_id"),
         "image_url": row["image_url"],
+        "thumb_uri": thumb_uri,   # <— inline thumbnail for Altair
         "title": row.get("title",""),
         "description": row.get("description",""),
         "created_at": row.get("created_at"),
@@ -535,7 +558,7 @@ for _, r in colors_df.iterrows():
                          "hex": hx, "r": rgb[0], "g": rgb[1], "b": rgb[2], "h": hsv[0], "s": hsv[1], "v": hsv[2]})
     if r["palette_hsv"]:
         dh, ds, dv = r["palette_hsv"][0]
-        dom_rows.append({"pin_id": r["pin_id"], "image_url": r["image_url"], "title": r["title"],
+        dom_rows.append({"pin_id": r["pin_id"], "image_url": r["image_url"], "thumb": r["thumb_uri"], "title": r["title"],
                          "h_deg": float(dh)*360.0, "v": float(dv), "hex": r["palette_hex"][0]})
 pal_df = pd.DataFrame(pal_rows)
 dom_df = pd.DataFrame(dom_rows)
@@ -705,7 +728,7 @@ radial_chart = alt.Chart(radial_df).mark_arc(stroke=None).encode(
 st.altair_chart(radial_chart, use_container_width=False)
 
 # ===============================
-# Hue × Value Explorer (tight, responsive thumbnails) — separated charts
+# Hue × Value Explorer (tight thumbnails, interactive)
 # ===============================
 
 st.subheader("Hue × Value Explorer (drag to filter & see pins)")
@@ -725,11 +748,10 @@ if not dom_df.empty:
         .add_params(brush)
         .properties(height=240)
     )
-    st.altair_chart(scatter, use_container_width=True)
 
-    # Thumbnail grid (minimal gaps, responsive-ish)
-    thumb_e = max(56, min(thumb_size, 100))
-    grid_cols = 12
+    # Tight, responsive-ish thumbnail grid (data-URIs, no CORS)
+    thumb_e = 56  # compact cells; overall chart will scale with container
+    grid_cols = 14
     thumbs = (
         alt.Chart(dom_df)
         .transform_filter(brush)
@@ -741,15 +763,15 @@ if not dom_df.empty:
                     scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
             y=alt.Y("row:O", axis=None, sort=None,
                     scale=alt.Scale(padding=0, paddingInner=0, paddingOuter=0)),
-            url="image_url:N",
+            url="thumb:N",
             tooltip=["title:N"]
         )
-        .properties(width=grid_cols*thumb_e,
-                    height=thumb_e * (max(1, math.ceil(len(dom_df)/grid_cols))))
+        .properties(width=alt.Step(thumb_e), height=alt.Step(thumb_e))
         .configure_scale(bandPaddingInner=0, bandPaddingOuter=0)
         .configure_view(strokeWidth=0)
     )
-    st.altair_chart(thumbs, use_container_width=True)
+
+    st.altair_chart(alt.vconcat(scatter, thumbs).resolve_scale(color="independent"), use_container_width=True)
 else:
     st.info("No dominant-color points available for the explorer.")
 
