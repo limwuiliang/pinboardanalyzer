@@ -2,8 +2,17 @@
 # -------------------------------------------------------------
 # Pinterest Board Color & Trend Analyzer — resilient board-only fetch
 # -------------------------------------------------------------
+# Sources, in order:
+#  1) HTML JSON (__PWS_DATA__) for early pins (+ board_id)
+#  2) BoardFeedResource (if cookie provided; fast + rich)
+#  3) **Pidgets (public, no login) pagination**  << NEW
+#  4) RSS with Atom rel="next" + ?num=100 fallback
+#  5) HTML ?page=2..10 (last resort)
+# Visuals kept: Master Palette, Pin Gallery (CSS grid + hover), Hue Histogram,
+#               Hue × Value Radial Map (smoothed)
+# -------------------------------------------------------------
 
-import io, re, math, json, html, xml.etree.ElementTree as ET
+import io, re, json, html, math, xml.etree.ElementTree as ET
 from urllib.parse import urlparse, urljoin
 
 import requests, numpy as np, pandas as pd
@@ -14,7 +23,7 @@ import streamlit as st
 import altair as alt
 
 # ===============================
-# Utils
+# Helpers
 # ===============================
 
 def hex_from_rgb(rgb_tuple):
@@ -37,14 +46,13 @@ def rgb_to_hsv_np(rgb):
     v = mx
     return np.stack([h,s,v], axis=-1)
 
-# ----- headers / cookies -----
 def _get_cookie_val(cookie: str | None, key: str) -> str | None:
     if not cookie: return None
     m = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", cookie)
     return m.group(1) if m else None
 
 def build_headers(cookie: str | None, accept="*/*", referer="https://www.pinterest.com/"):
-    headers = {
+    h = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": accept,
         "Accept-Language": "en-US,en;q=0.9",
@@ -52,13 +60,13 @@ def build_headers(cookie: str | None, accept="*/*", referer="https://www.pintere
         "X-Requested-With": "XMLHttpRequest",
     }
     if cookie:
-        headers["Cookie"] = cookie
-        csrft = _get_cookie_val(cookie, "csrftoken")
-        if csrft:
-            headers["X-CSRFToken"] = csrft
-    return headers
+        h["Cookie"] = cookie
+        csrf = _get_cookie_val(cookie, "csrftoken")
+        if csrf:
+            h["X-CSRFToken"] = csrf
+    return h
 
-# ----- pinimg size rewrite -----
+# pinimg size rewrite
 PIN_SIZE_PATTERN = re.compile(r"/(orig(?:inals)?|[0-9]{3,4}x)/", re.IGNORECASE)
 def rewrite_pinimg_size(u: str, size: str) -> str:
     if "i.pinimg.com" not in u: return u
@@ -68,6 +76,14 @@ def rewrite_pinimg_size(u: str, size: str) -> str:
         parts.insert(4, size)
         return "/".join(parts)
     return u
+
+def _normalize_board_path(u: str):
+    try:
+        p = urlparse(u)
+        parts = [x for x in (p.path or "").strip("/").split("/") if x]
+        return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else None
+    except Exception:
+        return None
 
 # ===============================
 # Image IO
@@ -106,18 +122,10 @@ def load_image_as_array(url, cookie=None, max_side=512):
     return None
 
 # ===============================
-# Scraping pipeline
+# Scrapers
 # ===============================
 
 PINTEREST_IMG_RE = re.compile(r'https?://i\.pinimg\.com/[^\s">]+\.(?:jpg|jpeg|png|webp)')
-
-def _normalize_board_path(u: str):
-    try:
-        p = urlparse(u)
-        parts = [x for x in (p.path or "").lower().strip("/").split("/") if x]
-        return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else None
-    except Exception:
-        return None
 
 @st.cache_data(show_spinner=True)
 def fetch_board_html(url: str, cookie=None) -> str:
@@ -151,8 +159,7 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
             if isinstance(images, dict):
                 for key in ("orig","736x","474x","236x","170x","small","medium","large"):
                     d = images.get(key)
-                    if isinstance(d, dict) and d.get("url"):
-                        img_url = d["url"]; break
+                    if isinstance(d, dict) and d.get("url"): img_url = d["url"]; break
             belongs = False
             b = o.get("board") or {}
             burl = b.get("url") or o.get("board_url") or o.get("url")
@@ -172,6 +179,7 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
     try: walk(data)
     except Exception: pass
 
+    # dedup & cap
     dedup, seen = [], set()
     for p in pins:
         u = p.get("image_url")
@@ -180,15 +188,13 @@ def extract_pins_from_html(html_text: str, board_url: str, max_pins: int = 200):
         if len(dedup) >= max_pins: break
     return dedup, board_id
 
-# ---- Internal feed (works best with cookie + X-CSRFToken) ----
+# ---- BoardFeedResource (cookie-based; optional) ----
 @st.cache_data(show_spinner=True)
 def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200, page_size: int = 50, max_pages: int = 10):
     path = _normalize_board_path(board_url) or ""
     source_url = f"/{path}/"
     endpoint = "https://www.pinterest.com/resource/BoardFeedResource/get/"
-
-    pins, seen = [], set()
-    bookmark, pages = None, 0
+    pins, seen, bookmark, pages = [], set(), None, 0
 
     def params(book):
         options = {"board_id": board_id, "page_size": page_size}
@@ -201,11 +207,9 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
             r = requests.get(endpoint, params=params(bookmark),
                              headers=build_headers(cookie, accept="application/json"), timeout=20)
             if r.status_code != 200: break
-            obj = r.json()
+            obj = r.json(); pages += 1
             rr = obj.get("resource_response") or {}
-            data = rr.get("data") or []
-            bookmark = rr.get("bookmark")
-            pages += 1
+            data = rr.get("data") or []; bookmark = rr.get("bookmark")
             for o in data:
                 images = o.get("images") or (o.get("image") if isinstance(o.get("image"), dict) else None)
                 img_url = None
@@ -229,7 +233,53 @@ def fetch_board_feed(board_url: str, board_id: str, cookie=None, want: int = 200
             break
     return pins, pages
 
-# ---- RSS (try num=100 + Atom rel="next") ----
+# ---- NEW: Pidgets (public, no login) ----
+@st.cache_data(show_spinner=True)
+def fetch_board_pidgets(board_url: str, want: int = 200, page_size: int = 50, max_pages: int = 12):
+    """
+    Public JSON: https://widgets.pinterest.com/v3/pidgets/boards/<user>/<board>/pins/
+    Supports `bookmark` cursor pagination. No cookie required.
+    """
+    path = _normalize_board_path(board_url)
+    if not path:
+        return [], 0
+    base = f"https://widgets.pinterest.com/v3/pidgets/boards/{path}/pins/"
+    params = {"page_size": str(page_size)}
+    headers = build_headers(cookie=None, accept="application/json", referer=f"https://www.pinterest.com/{path}/")
+
+    pins, seen, pages, bookmark = [], set(), 0, None
+    while len(pins) < want and pages < max_pages:
+        try:
+            q = params.copy()
+            if bookmark: q["bookmark"] = bookmark
+            r = requests.get(base, params=q, headers=headers, timeout=20)
+            if r.status_code != 200: break
+            obj = r.json(); pages += 1
+            data = (obj.get("data") or {})
+            bookmark = data.get("bookmark")
+            for o in (data.get("pins") or []):
+                images = o.get("images") or {}
+                img_url = None
+                for key in ("736x","564x","474x","236x","orig","170x"):
+                    d = images.get(key)
+                    if isinstance(d, dict) and d.get("url"):
+                        img_url = d["url"]; break
+                if not img_url: continue
+                if img_url in seen: continue
+                seen.add(img_url)
+                pins.append({
+                    "pin_id": str(o.get("id")) if o.get("id") else None,
+                    "title": o.get("title") or o.get("grid_title") or o.get("alt_text") or "",
+                    "description": o.get("description") or "",
+                    "created_at": o.get("created_at") or o.get("created") or None,
+                    "image_url": img_url,
+                })
+            if not bookmark: break
+        except Exception:
+            break
+    return pins, pages
+
+# ---- RSS (paginated via Atom rel="next"; also try ?num=100) ----
 def _parse_rss_batch(xml_text: str):
     try:
         root = ET.fromstring(xml_text)
@@ -264,20 +314,17 @@ def _parse_rss_batch(xml_text: str):
     return pins, next_href
 
 @st.cache_data(show_spinner=True)
-def fetch_board_rss_paginated(board_url: str, cookie=None, max_items: int = 200, max_pages: int = 10):
+def fetch_board_rss_paginated(board_url: str, max_items: int = 200, max_pages: int = 12):
     try:
         p = urlparse(board_url)
         parts = [x for x in (p.path or "").strip("/").split("/") if x]
         if len(parts) < 2: return [], 0
         base = f"{p.scheme}://{p.netloc}/{parts[0]}/{parts[1]}.rss"
-        # try num=100 first
-        candidates = [f"{base}?num=100", base]
-        headers = build_headers(cookie, accept="application/rss+xml, application/xml;q=0.9, */*;q=0.8")
         all_pins, seen, pages = [], set(), 0
-        for start_url in candidates:
-            next_url = start_url
+        for start in (f"{base}?num=100", base):
+            next_url = start
             while next_url and pages < max_pages and len(all_pins) < max_items:
-                r = requests.get(next_url, timeout=20, headers=headers)
+                r = requests.get(next_url, timeout=20, headers=build_headers(None, accept="application/rss+xml, application/xml;q=0.9, */*;q=0.8"))
                 if r.status_code != 200: break
                 batch, next_href = _parse_rss_batch(r.text)
                 pages += 1
@@ -292,14 +339,14 @@ def fetch_board_rss_paginated(board_url: str, cookie=None, max_items: int = 200,
     except Exception:
         return [], 0
 
-# ---- HTML ?page=2..10 (last resort) ----
+# ---- HTML ?page=2..10 fallback ----
 @st.cache_data(show_spinner=True)
-def fetch_board_html_pages(board_url: str, cookie=None, max_items: int = 200, max_pages: int = 10):
+def fetch_board_html_pages(board_url: str, max_items: int = 200, max_pages: int = 10):
     pins, seen, pages = [], set(), 0
     urls = [board_url.rstrip("/")] + [f"{board_url.rstrip('/')}/?page={i}" for i in range(2, max_pages+1)]
     for u in urls:
         try:
-            html_text = fetch_board_html(u, cookie=cookie)
+            html_text = fetch_board_html(u, cookie=None)
             page_pins, _ = extract_pins_from_html(html_text, board_url, max_pins=max_items*2)
             pages += 1
             for p in page_pins:
@@ -311,19 +358,12 @@ def fetch_board_html_pages(board_url: str, cookie=None, max_items: int = 200, ma
             continue
     return pins, pages
 
-# ---- Manual paste parsing ----
-def parse_manual_text(s: str):
-    if not s: return []
-    urls = list({u.strip() for u in re.findall(r"https?://i\.pinimg\.com/[^\s\"'>)]+", s)})
-    return [{"pin_id": None, "title": "", "description": "", "created_at": None, "image_url": u} for u in urls]
-
+# ---- Orchestrator ----
 @st.cache_data(show_spinner=True)
-def scrape_board_boardonly(board_url: str, cookie=None, manual_text: str | None = None, max_pins: int = 200):
-    # Manual first (if provided)
-    manual_pins = parse_manual_text(manual_text or "")
-    best = manual_pins[:]
-    src = "manual" if manual_pins else ""
-
+def scrape_board_boardonly(board_url: str, cookie=None, max_pins: int = 200):
+    """
+    Try multiple sources; take the most complete result (board-only).
+    """
     # HTML base
     try:
         html_doc = fetch_board_html(board_url, cookie=cookie)
@@ -331,23 +371,27 @@ def scrape_board_boardonly(board_url: str, cookie=None, manual_text: str | None 
     except Exception:
         from_html, board_id = [], None
 
-    if len(from_html) > len(best): best, src = from_html, "json"
+    best, source = list(from_html), "json" if from_html else ""
 
-    # Internal feed (if board_id)
+    # Cookie feed (best if cookie present)
     feed_pins, feed_pages = [], 0
-    if board_id:
-        feed_pins, feed_pages = fetch_board_feed(board_url, board_id, cookie=cookie, want=max_pins*3, page_size=50, max_pages=10)
-        if len(feed_pins) > len(best): best, src = feed_pins, "json+api"
+    if board_id and cookie:
+        feed_pins, feed_pages = fetch_board_feed(board_url, board_id, cookie=cookie, want=max_pins*3, page_size=50, max_pages=12)
+        if len(feed_pins) > len(best): best, source = feed_pins, "json+api"
 
-    # RSS (num=100 + next)
-    rss_pins, rss_pages = fetch_board_rss_paginated(board_url, cookie=cookie, max_items=max_pins*3, max_pages=12)
-    if len(rss_pins) > len(best): best, src = rss_pins, ("json+api+rss" if src.startswith("json") else "rss")
+    # NEW: Pidgets (public, no login)
+    pidgets_pins, pidgets_pages = fetch_board_pidgets(board_url, want=max_pins*3, page_size=50, max_pages=12)
+    if len(pidgets_pins) > len(best): best, source = pidgets_pins, ("api-pidgets" if source=="" else f"{source}+pidgets")
 
-    # HTML pages ?page=2..10
-    html2_pins, html2_pages = fetch_board_html_pages(board_url, cookie=cookie, max_items=max_pins*3, max_pages=10)
-    if len(html2_pins) > len(best): best, src = html2_pins, ("json+pages" if src else "pages")
+    # RSS
+    rss_pins, rss_pages = fetch_board_rss_paginated(board_url, max_items=max_pins*3, max_pages=12)
+    if len(rss_pins) > len(best): best, source = rss_pins, ("rss" if source=="" else f"{source}+rss")
 
-    # cap & dedup
+    # HTML pages
+    html2_pins, html2_pages = fetch_board_html_pages(board_url, max_items=max_pins*3, max_pages=10)
+    if len(html2_pins) > len(best): best, source = html2_pins, ("pages" if source=="" else f"{source}+pages")
+
+    # dedup + cap
     seen, final = set(), []
     for p in best:
         u = p.get("image_url")
@@ -356,12 +400,12 @@ def scrape_board_boardonly(board_url: str, cookie=None, manual_text: str | None 
         if len(final) >= max_pins: break
 
     meta = {
-        "source": src or "none",
+        "source": source or "none",
         "count_found": len(best),
-        "manual_used": bool(manual_pins),
         "feed_pages": feed_pages,
+        "pidgets_pages": pidgets_pages,
         "rss_pages": rss_pages,
-        "html_pages": html2_pages if 'html2_pages' in locals() else 0,
+        "html_pages": html2_pages,
     }
     return final, meta
 
@@ -376,20 +420,16 @@ st.caption("Paste a **public** Pinterest board URL and click Analyze.")
 board_url = st.text_input("Pinterest board URL", placeholder="https://www.pinterest.com/<username>/<board-slug>/")
 
 with st.expander("Options", expanded=False):
-    pin_limit = st.slider("Max pins to analyze", 20, 500, 120, step=10)
+    pin_limit = st.slider("Max pins to analyze", 30, 500, 120, step=10)
     palette_k = st.slider("Colors per image (KMeans)", 3, 8, 5)
     master_palette_k = st.slider("Master palette size (across board)", 5, 20, 10)
     thumb_size = st.slider("Pin thumbnail size (px)", 90, 200, 120, step=10)
 
 with st.expander("Advanced (optional)", expanded=False):
-    st.write("If your count stalls at ~25, paste your **Cookie** (private env) or use **Manual mode** below.")
+    st.write("If available, you can paste a Pinterest **Cookie** (private env). Not required.")
     cookie_from_secrets = st.toggle("Use `st.secrets['PINTEREST_COOKIE']`", value=False)
     cookie_text = st.text_input("Cookie header", value="", type="password", placeholder="sb=...; _pinterest_sess=...; csrftoken=...;")
     cookie = st.secrets.get("PINTEREST_COOKIE") if (cookie_from_secrets and "PINTEREST_COOKIE" in st.secrets) else (cookie_text or None)
-
-with st.expander("Manual mode (guaranteed)", expanded=False):
-    st.write("Paste **image URLs** (one per line) or paste the page’s DOM/HTML. We’ll extract all `i.pinimg.com` URLs.")
-    manual_text = st.text_area("Paste here (optional)", height=140, placeholder="https://i.pinimg.com/736x/...jpg\nhttps://i.pinimg.com/474x/...jpg\n...")
 
 if not st.button("Analyze"):
     st.stop()
@@ -398,12 +438,15 @@ if not board_url or "pinterest." not in urlparse(board_url).netloc:
     st.error("Please paste a valid public Pinterest board URL."); st.stop()
 
 # ---- Scrape ----
-pins, meta = scrape_board_boardonly(board_url, cookie=cookie, manual_text=manual_text, max_pins=pin_limit)
+pins, meta = scrape_board_boardonly(board_url, cookie=cookie, max_pins=pin_limit)
 if not pins:
     st.error("No pins found. The board may be private or blocked in this region."); st.stop()
 pins_df = pd.DataFrame(pins)
 
-# ---- Palette extraction ----
+# ===============================
+# Color extraction
+# ===============================
+
 progress = st.progress(0); records, fetch_failures = [], 0
 for idx, row in pins_df.iterrows():
     arr = load_image_as_array(row["image_url"], cookie=cookie)
@@ -432,7 +475,7 @@ if not records:
     st.error("Images could not be processed."); st.stop()
 colors_df = pd.DataFrame(records)
 
-# ---- Long palette df ----
+# Long-form palette rows
 pal_rows = []
 for _, r in colors_df.iterrows():
     for i, hx in enumerate(r["palette_hex"]):
@@ -442,7 +485,7 @@ for _, r in colors_df.iterrows():
 pal_df = pd.DataFrame(pal_rows)
 
 # ===============================
-# Visuals (kept from your latest)
+# Visuals
 # ===============================
 
 # Master palette
@@ -474,7 +517,7 @@ bar = alt.Chart(share_df).mark_bar(stroke="black", strokeWidth=0.25).encode(
 ).properties(height=240)
 st.altair_chart(bar, use_container_width=True)
 
-# Pin Gallery (CSS grid + hover overlay) — all pins
+# Pin Gallery (CSS grid + hover overlay)
 st.subheader("Pin Gallery")
 st.caption(f"Showing {len(colors_df)} of {len(pins_df)} pins (image fetch failures: {fetch_failures})")
 
@@ -522,7 +565,7 @@ for _, r in colors_df.iterrows():
 </div>""")
 st.markdown(f"<div class='pin-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
-# Hue histogram
+# Hue Distribution
 st.subheader("Hue Distribution")
 pal_df["h_deg"] = (pal_df["h"] * 360.0).round(1)
 bins = np.arange(0, 361, 10); labels = (bins[:-1] + bins[1:]) / 2
@@ -585,8 +628,8 @@ with st.expander("🔧 Diagnostics"):
         "pins_parsed_total": int(len(pins_df)),
         "source": meta.get("source"),
         "count_found_before_cap": meta.get("count_found"),
-        "manual_used": meta.get("manual_used"),
         "feed_pages": meta.get("feed_pages"),
+        "pidgets_pages": meta.get("pidgets_pages"),
         "rss_pages": meta.get("rss_pages"),
         "html_pages": meta.get("html_pages"),
     })
