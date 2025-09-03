@@ -1,0 +1,7 @@
+streamlit>=1.36
+numpy
+pandas
+pillow
+scikit-learn
+altair
+requests
