@@ -5,7 +5,7 @@
 # - Paste a PUBLIC Pinterest board URL and click Analyze.
 # - Only analyzes pins that BELONG to that board (excludes "More like this").
 # - Tries HTML JSON; if blocked, paginates the board's RSS via Atom rel="next".
-# - Robust image fetching (Referer + size variants).
+# - Robust image fetching (Referer + size variants). 
 # - Visuals: Master palette, Pin Gallery (CSS grid + hover overlay),
 #   Hue histogram, Hue×Value Radial Map (smoothed).
 # - Diagnostics show method, counts, and RSS/API paging stats.
