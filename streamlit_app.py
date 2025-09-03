@@ -4,7 +4,7 @@
 # -------------------------------------------------------------
 # Sources (unioned, not either/or):
 #  1) HTML JSON (__PWS_DATA__) for early pins (+ board_id)
-#  2) BoardFeedResource (if cookie provided; fast + rich)
+#  2) BoardFeedResource (if cookie provided; fast + rich) 
 #  3) Pidgets (public, no login) pagination  << main workhorse
 #  4) RSS with Atom rel="next" + ?num=100 fallback
 #  5) HTML ?page=2..10 (last resort)
